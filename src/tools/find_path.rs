@@ -160,19 +160,13 @@ impl Tool for FindPath {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "find_path".to_string(),
-            description: r#"Find files and directories by name pattern.
+            description: r#"Fast file path pattern matching tool that works with any codebase size
 
-Uses glob-style patterns:
-- * matches any characters
-- ? matches a single character
-
-Automatically skips common build/dependency directories.
-
-Examples:
-- Find all Rust files: pattern="*.rs"
-- Find test files: pattern="*test*"
-- Find specific file: pattern="Cargo.toml"
-- Find directories named src: pattern="src", file_type="directory""#.to_string(),
+- Supports glob patterns like "**/*.js" or "src/**/*.ts"
+- Returns matching file paths sorted alphabetically
+- Prefer the `grep` tool to this tool when searching for symbols unless you have specific information about paths.
+- Use this tool when you need to find files by name patterns
+- Results are paginated with 50 matches per page. Use the optional 'offset' parameter to request subsequent pages."#.to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

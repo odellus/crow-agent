@@ -9,10 +9,13 @@ use agent_client_protocol::{
     self as acp, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
     CancelNotification, ContentBlock, ContentChunk, ExtNotification, ExtRequest, ExtResponse,
     Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse,
-    ProtocolVersion, SessionId, SessionNotification, SessionUpdate, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason, TextContent,
+    NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, SessionId,
+    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
+    TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolKind,
 };
+use futures::StreamExt;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 
@@ -20,7 +23,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
+use rig::agent::MultiTurnStreamItem;
+use rig::message::{AssistantContent, Message, Text, UserContent};
+use rig::streaming::StreamedAssistantContent;
+use rig::OneOrMany;
 use crate::config::Config;
+use crate::hooks::TelemetryHook;
 use crate::telemetry::Telemetry;
 use crate::CrowAgent;
 
@@ -28,6 +36,10 @@ use crate::CrowAgent;
 struct Session {
     agent: CrowAgent,
     history: RefCell<Vec<rig::message::Message>>,
+    /// Active hook for the current operation - used for cancellation
+    active_hook: RefCell<Option<TelemetryHook>>,
+    /// Flag to indicate the session should be cancelled
+    cancelled: Cell<bool>,
 }
 
 /// Crow's ACP Agent implementation
@@ -121,6 +133,8 @@ impl acp::Agent for CrowAcpAgent {
             Session {
                 agent,
                 history: RefCell::new(Vec::new()),
+                active_hook: RefCell::new(None),
+                cancelled: Cell::new(false),
             },
         );
 
@@ -151,30 +165,230 @@ impl acp::Agent for CrowAcpAgent {
             return Err(acp::Error::invalid_params());
         }
 
-        // Get the session and run the prompt
-        let response = {
+        // Get the session and start streaming
+        let stream_result = {
             let sessions = self.sessions.borrow();
-            let session = sessions.get(&session_id).ok_or_else(acp::Error::invalid_params)?;
+            let session = sessions
+                .get(&session_id)
+                .ok_or_else(acp::Error::invalid_params)?;
 
-            let mut history = session.history.borrow_mut();
-            session.agent.chat(&prompt_text, &mut history).await
+            // Reset cancelled flag at start of new prompt
+            session.cancelled.set(false);
+
+            let history = session.history.borrow().clone();
+            session.agent.chat_stream(&prompt_text, history).await
         };
 
-        match response {
-            Ok(response_text) => {
-                // Stream the response back as a chunk
-                self.send_update(SessionNotification::new(
-                    args.session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                        TextContent::new(response_text),
-                    ))),
-                ))
-                .await?;
+        match stream_result {
+            Ok((stream_request, hook)) => {
+                // Store the hook for potential cancellation
+                {
+                    let sessions = self.sessions.borrow();
+                    if let Some(session) = sessions.get(&session_id) {
+                        *session.active_hook.borrow_mut() = Some(hook.clone());
+                    }
+                }
+
+                // Await the request to get the actual stream
+                let mut stream = stream_request.await;
+
+                // Accumulate the assistant's response for history
+                let mut accumulated_response = String::new();
+
+                // Process stream items and send updates
+                while let Some(item) = stream.next().await {
+                    // Check if cancelled
+                    {
+                        let sessions = self.sessions.borrow();
+                        if let Some(session) = sessions.get(&session_id) {
+                            if session.cancelled.get() {
+                                info!("Session {} was cancelled, breaking stream loop", session_id);
+                                // Clear the active hook
+                                *session.active_hook.borrow_mut() = None;
+                                return Ok(PromptResponse::new(StopReason::Cancelled));
+                            }
+                        }
+                    }
+
+                    match item {
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
+                            match content {
+                                StreamedAssistantContent::Text(text) => {
+                                    // Accumulate text for history
+                                    accumulated_response.push_str(&text.text);
+
+                                    // Stream text chunks immediately
+                                    self.send_update(SessionNotification::new(
+                                        args.session_id.clone(),
+                                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                            ContentBlock::Text(TextContent::new(text.text)),
+                                        )),
+                                    ))
+                                    .await?;
+                                }
+                                StreamedAssistantContent::ToolCall(tool_call) => {
+                                    // Send tool call notification
+                                    let tool_call_id =
+                                        ToolCallId::from(tool_call.id.clone());
+                                    let kind = tool_name_to_kind(&tool_call.function.name);
+                                    let title = format!("Calling {}", tool_call.function.name);
+
+                                    self.send_update(SessionNotification::new(
+                                        args.session_id.clone(),
+                                        SessionUpdate::ToolCall(
+                                            ToolCall::new(tool_call_id, title)
+                                                .kind(kind)
+                                                .status(ToolCallStatus::InProgress)
+                                                .raw_input(tool_call.function.arguments.clone()),
+                                        ),
+                                    ))
+                                    .await?;
+
+                                    // If this is todo_write, also send a Plan update
+                                    if tool_call.function.name == "todo_write" {
+                                        if let Some(plan) =
+                                            parse_todo_write_to_plan(&tool_call.function.arguments)
+                                        {
+                                            self.send_update(SessionNotification::new(
+                                                args.session_id.clone(),
+                                                SessionUpdate::Plan(plan),
+                                            ))
+                                            .await?;
+                                        }
+                                    }
+                                }
+                                StreamedAssistantContent::Reasoning(reasoning) => {
+                                    // Send reasoning as thought chunk
+                                    let text = reasoning.reasoning.join("");
+                                    self.send_update(SessionNotification::new(
+                                        args.session_id.clone(),
+                                        SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                                            ContentBlock::Text(TextContent::new(text)),
+                                        )),
+                                    ))
+                                    .await?;
+                                }
+                                StreamedAssistantContent::ToolCallDelta { .. } => {
+                                    // Skip tool call deltas - we handle complete tool calls
+                                }
+                                StreamedAssistantContent::Final(_) => {
+                                    // Final response handled separately
+                                }
+                            }
+                        }
+                        Ok(MultiTurnStreamItem::StreamUserItem(user_content)) => {
+                            // Tool results - send as tool call update
+                            let rig::streaming::StreamedUserContent::ToolResult(result) =
+                                user_content;
+                            {
+                                let tool_call_id = ToolCallId::from(result.id.clone());
+                                let result_text = result
+                                    .content
+                                    .iter()
+                                    .filter_map(|c| {
+                                        if let rig::message::ToolResultContent::Text(t) = c {
+                                            Some(t.text.clone())
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n");
+
+                                self.send_update(SessionNotification::new(
+                                    args.session_id.clone(),
+                                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                        tool_call_id,
+                                        ToolCallUpdateFields::new()
+                                            .status(ToolCallStatus::Completed)
+                                            .content(vec![result_text.into()]),
+                                    )),
+                                ))
+                                .await?;
+                            }
+                        }
+                        Ok(MultiTurnStreamItem::FinalResponse(final_resp)) => {
+                            // Stream completed successfully - update history
+                            info!("Stream completed, updating history");
+
+                            // Use the final response text if available, otherwise use accumulated
+                            let response_text = if !final_resp.response().is_empty() {
+                                final_resp.response().to_string()
+                            } else {
+                                accumulated_response.clone()
+                            };
+
+                            // Update session history with user message and assistant response
+                            let sessions = self.sessions.borrow();
+                            if let Some(session) = sessions.get(&session_id) {
+                                let mut history = session.history.borrow_mut();
+
+                                // Add user message
+                                history.push(Message::User {
+                                    content: OneOrMany::one(UserContent::text(&prompt_text)),
+                                });
+
+                                // Add assistant response
+                                history.push(Message::Assistant {
+                                    id: None,
+                                    content: OneOrMany::one(AssistantContent::Text(Text {
+                                        text: response_text,
+                                    })),
+                                });
+
+                                info!("History updated, now has {} messages", history.len());
+
+                                // Clear the active hook since operation completed
+                                *session.active_hook.borrow_mut() = None;
+                            }
+                        }
+                        Ok(_) => {
+                            // Handle any other MultiTurnStreamItem variants
+                        }
+                        Err(e) => {
+                            // Check if this was a cancellation
+                            let is_cancelled = e.to_string().contains("PromptCancelled");
+
+                            if is_cancelled {
+                                info!("Stream was cancelled");
+                                // Clear the active hook
+                                let sessions = self.sessions.borrow();
+                                if let Some(session) = sessions.get(&session_id) {
+                                    *session.active_hook.borrow_mut() = None;
+                                }
+                                return Ok(PromptResponse::new(StopReason::Cancelled));
+                            }
+
+                            error!("Stream error: {}", e);
+                            self.send_update(SessionNotification::new(
+                                args.session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(format!("Error: {}", e))),
+                                )),
+                            ))
+                            .await?;
+
+                            // Clear the active hook on error
+                            let sessions = self.sessions.borrow();
+                            if let Some(session) = sessions.get(&session_id) {
+                                *session.active_hook.borrow_mut() = None;
+                            }
+                            return Ok(PromptResponse::new(StopReason::Refusal));
+                        }
+                    }
+                }
 
                 Ok(PromptResponse::new(StopReason::EndTurn))
             }
             Err(e) => {
                 error!("Prompt error: {}", e);
+
+                // Clear the active hook
+                let sessions = self.sessions.borrow();
+                if let Some(session) = sessions.get(&session_id) {
+                    *session.active_hook.borrow_mut() = None;
+                }
+                drop(sessions);
 
                 // Send error as a message
                 self.send_update(SessionNotification::new(
@@ -192,9 +406,26 @@ impl acp::Agent for CrowAcpAgent {
     }
 
     async fn cancel(&self, args: CancelNotification) -> acp::Result<()> {
-        info!("ACP cancel: session_id={}", args.session_id.0);
-        // TODO: Implement cancellation
-        // For now, just acknowledge
+        let session_id = args.session_id.0.to_string();
+        info!("ACP cancel: session_id={}", session_id);
+
+        // Set cancelled flag and trigger hook cancel
+        let sessions = self.sessions.borrow();
+        if let Some(session) = sessions.get(&session_id) {
+            // Set the cancelled flag - this will be checked in the stream loop
+            session.cancelled.set(true);
+            info!("Set cancelled flag for session {}", session_id);
+
+            // Also trigger the hook's cancel signal for interrupting tool execution
+            let hook = session.active_hook.borrow();
+            if let Some(ref h) = *hook {
+                info!("Triggering cancel signal for session {}", session_id);
+                h.cancel().await;
+            }
+        } else {
+            info!("Session {} not found for cancel", session_id);
+        }
+
         Ok(())
     }
 
@@ -220,6 +451,48 @@ impl acp::Agent for CrowAcpAgent {
     async fn ext_notification(&self, args: ExtNotification) -> acp::Result<()> {
         info!("ACP ext_notification: {}", args.method);
         Ok(())
+    }
+}
+
+/// Map tool names to ACP ToolKind for appropriate UI treatment
+fn tool_name_to_kind(name: &str) -> ToolKind {
+    match name {
+        "read_file" => ToolKind::Read,
+        "edit_file" => ToolKind::Edit,
+        "list_directory" => ToolKind::Read,
+        "grep" | "find_path" => ToolKind::Search,
+        "terminal" => ToolKind::Execute,
+        "thinking" => ToolKind::Think,
+        "fetch" | "web_search" => ToolKind::Fetch,
+        _ => ToolKind::Other,
+    }
+}
+
+/// Parse todo_write tool arguments into an ACP Plan
+fn parse_todo_write_to_plan(args: &serde_json::Value) -> Option<Plan> {
+    let todos = args.get("todos")?.as_array()?;
+
+    let entries: Vec<PlanEntry> = todos
+        .iter()
+        .filter_map(|todo| {
+            let content = todo.get("content")?.as_str()?.to_string();
+            let status_str = todo.get("status")?.as_str()?;
+
+            let status = match status_str {
+                "pending" => PlanEntryStatus::Pending,
+                "in_progress" => PlanEntryStatus::InProgress,
+                "completed" => PlanEntryStatus::Completed,
+                _ => PlanEntryStatus::Pending,
+            };
+
+            Some(PlanEntry::new(content, PlanEntryPriority::Medium, status))
+        })
+        .collect();
+
+    if entries.is_empty() {
+        None
+    } else {
+        Some(Plan::new(entries))
     }
 }
 

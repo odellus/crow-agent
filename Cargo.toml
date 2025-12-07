@@ -8,8 +8,8 @@ edition = "2021"
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
 
-# LLM framework - using local fork with PromptHook exports
-rig-core = { path = "../rig/rig-core" }
+# LLM framework - using local fork with enhanced telemetry (git submodule)
+rig-core = { path = "rig/rig-core" }
 
 # Workflow (optional for now, will use later)
 # graph-flow = { path = "../rs-graph-llm/graph-flow" }
@@ -49,6 +49,7 @@ grep-searcher = "0.1"
 grep-matcher = "0.1"
 ignore = "0.4"  # For .gitignore-aware file searching
 regex = "1.10"
+similar = "2.6"  # For unified diff generation
 glob = "0.3"
 tempfile = { version = "3.10", optional = true }
 parking_lot = "0.12"
@@ -63,6 +64,7 @@ which = "7.0"
 
 # ACP (Agent Client Protocol) for Zed integration
 agent-client-protocol = { version = "0.8", features = ["unstable"] }
+futures = "0.3"
 futures-io = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
 

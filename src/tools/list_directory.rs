@@ -170,15 +170,7 @@ impl Tool for ListDirectory {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "list_directory".to_string(),
-            description: r#"List the contents of a directory.
-
-Use this to explore the project structure and find files.
-Directories are shown with a trailing '/'.
-
-Use depth parameter for recursive listing:
-- depth=0 (default): current directory only
-- depth=1: include immediate subdirectories
-- depth=2+: deeper nesting"#.to_string(),
+            description: r#"Lists files and directories in a given path. Prefer the `grep` or `find_path` tools when searching the codebase."#.to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

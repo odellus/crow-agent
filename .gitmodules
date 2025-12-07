@@ -1,0 +1,4 @@
+[submodule "rig"]
+	path = rig
+	url = git@github.com:odellus/rig.git
+	branch = enhanced-telemetry

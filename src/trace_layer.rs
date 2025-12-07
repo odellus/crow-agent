@@ -36,6 +36,12 @@ pub struct TraceData {
     pub tool_arguments: Option<String>,
     pub tool_result: Option<String>,
     pub error: Option<String>,
+    // Full request/response data
+    pub request_tools: Option<String>,
+    pub request_body: Option<String>,
+    pub response_body: Option<String>,
+    pub response_content: Option<String>,
+    pub response_tool_calls: Option<String>,
 }
 
 /// Visitor to extract gen_ai.* fields from spans
@@ -117,31 +123,41 @@ impl SqliteTraceLayer {
                     trace.completed_at.map(|t| t.to_rfc3339()),
                     trace.model_provider.as_deref().unwrap_or("unknown"),
                     trace.model_id.as_deref().unwrap_or("unknown"),
-                    // request_messages: combine system + prompt
-                    trace.system_instructions.as_ref().map(|s| {
-                        serde_json::json!({
-                            "system": s,
-                            "prompt": trace.prompt
+                    // request_messages: use full request body if available, else system+prompt
+                    trace.request_body.clone().or_else(|| {
+                        trace.system_instructions.as_ref().map(|s| {
+                            serde_json::json!({
+                                "system": s,
+                                "prompt": trace.prompt
+                            })
+                            .to_string()
                         })
-                        .to_string()
                     }),
-                    // request_tools: tool name if this is a tool call
-                    trace.tool_name.as_ref().map(|_| {
-                        serde_json::json!({
-                            "tool": trace.tool_name,
-                            "arguments": trace.tool_arguments
+                    // request_tools: use full tools from request if available
+                    trace.request_tools.clone().or_else(|| {
+                        trace.tool_name.as_ref().map(|_| {
+                            serde_json::json!({
+                                "tool": trace.tool_name,
+                                "arguments": trace.tool_arguments
+                            })
+                            .to_string()
                         })
-                        .to_string()
                     }),
-                    // response_content: completion text
-                    trace.completion,
-                    // response_tool_calls: tool result
-                    trace.tool_result.as_ref().map(|r| {
-                        serde_json::json!({
-                            "tool": trace.tool_name,
-                            "result": r
+                    // response_content: use streaming accumulated content, else response body, else completion
+                    trace
+                        .response_content
+                        .clone()
+                        .or_else(|| trace.response_body.clone())
+                        .or_else(|| trace.completion.clone()),
+                    // response_tool_calls: use streaming accumulated tool calls, else tool result
+                    trace.response_tool_calls.clone().or_else(|| {
+                        trace.tool_result.as_ref().map(|r| {
+                            serde_json::json!({
+                                "tool": trace.tool_name,
+                                "result": r
+                            })
+                            .to_string()
                         })
-                        .to_string()
                     }),
                     trace.input_tokens,
                     trace.output_tokens,
@@ -181,11 +197,24 @@ where
             if let Some(sys) = visitor.fields.get("gen_ai.system_instructions") {
                 trace.system_instructions = Some(sys.clone());
             }
+            if let Some(provider) = visitor.fields.get("gen_ai.provider.name") {
+                trace.model_provider = Some(provider.clone());
+            }
+            if let Some(model) = visitor.fields.get("gen_ai.request.model") {
+                trace.model_id = Some(model.clone());
+            }
             if let Some(tool) = visitor.fields.get("gen_ai.tool.name") {
                 trace.tool_name = Some(tool.clone());
             }
             if let Some(call_id) = visitor.fields.get("gen_ai.tool.call.id") {
                 trace.tool_call_id = Some(call_id.clone());
+            }
+            // Capture request tools and body if available at span creation
+            if let Some(tools) = visitor.fields.get("gen_ai.request.tools") {
+                trace.request_tools = Some(tools.clone());
+            }
+            if let Some(body) = visitor.fields.get("gen_ai.request.body") {
+                trace.request_body = Some(body.clone());
             }
 
             if let Ok(mut spans) = self.spans.lock() {
@@ -230,6 +259,22 @@ where
                 }
                 if let Some(model) = visitor.fields.get("gen_ai.request.model") {
                     trace.model_id = Some(model.clone());
+                }
+                // Capture full request/response
+                if let Some(tools) = visitor.fields.get("gen_ai.request.tools") {
+                    trace.request_tools = Some(tools.clone());
+                }
+                if let Some(body) = visitor.fields.get("gen_ai.request.body") {
+                    trace.request_body = Some(body.clone());
+                }
+                if let Some(body) = visitor.fields.get("gen_ai.response.body") {
+                    trace.response_body = Some(body.clone());
+                }
+                if let Some(content) = visitor.fields.get("gen_ai.response.content") {
+                    trace.response_content = Some(content.clone());
+                }
+                if let Some(tool_calls) = visitor.fields.get("gen_ai.response.tool_calls") {
+                    trace.response_tool_calls = Some(tool_calls.clone());
                 }
             }
         }

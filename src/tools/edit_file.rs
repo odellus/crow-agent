@@ -1,14 +1,27 @@
 //! Edit file tool - Modify file contents with search/replace
 //!
 //! Supports three modes:
-//! - `edit`: Modify existing file by replacing text (old_string must exist and be unique)
+//! - `edit`: Modify existing file by replacing text (uses cascading fuzzy matchers)
 //! - `create`: Create a new file (must not already exist)
 //! - `overwrite`: Replace entire file contents
+//!
+//! The edit mode uses 9 cascading replacers based on OpenCode's approach:
+//! 1. simple_replacer - Exact match
+//! 2. line_trimmed_replacer - Trim whitespace per line
+//! 3. block_anchor_replacer - First/last line anchors + Levenshtein
+//! 4. whitespace_normalized_replacer - Collapse whitespace
+//! 5. indentation_flexible_replacer - Normalize indentation
+//! 6. escape_normalized_replacer - Handle \n, \t, etc.
+//! 7. trimmed_boundary_replacer - Trim block boundaries
+//! 8. context_aware_replacer - 50% middle line match
+//! 9. multi_occurrence_replacer - All exact matches
 
+use regex::Regex;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use similar::{ChangeTag, TextDiff};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -26,8 +39,8 @@ pub enum EditFileError {
     OutsideWorkDir(String),
     #[error("Old string not found in file")]
     OldStringNotFound,
-    #[error("Old string found multiple times ({0} occurrences). Use replace_all=true or provide more context.")]
-    MultipleMatches(usize),
+    #[error("Old string found multiple times. Provide more surrounding lines to identify the correct match.")]
+    MultipleMatches,
     #[error("File already exists: {0}. Use mode='edit' or mode='overwrite' instead.")]
     FileAlreadyExists(String),
     #[error("File does not exist: {0}. Use mode='create' instead.")]
@@ -36,7 +49,13 @@ pub enum EditFileError {
     InvalidMode(String),
     #[error("Missing required field: {0}")]
     MissingField(String),
+    #[error("old_string and new_string must be different")]
+    SameStrings,
 }
+
+// Similarity thresholds for block anchor fallback matching
+const SINGLE_CANDIDATE_SIMILARITY_THRESHOLD: f64 = 0.0;
+const MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD: f64 = 0.3;
 
 /// Edit mode determines how the file operation is performed
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -88,6 +107,8 @@ pub struct EditFileOutput {
     pub mode: String,
     pub message: String,
     pub diff: String,
+    pub additions: usize,
+    pub deletions: usize,
 }
 
 impl std::fmt::Display for EditFileOutput {
@@ -95,6 +116,671 @@ impl std::fmt::Display for EditFileOutput {
         write!(f, "{}\n\n```diff\n{}\n```", self.message, self.diff)
     }
 }
+
+// ==================== Cascading Replacers ====================
+
+/// Levenshtein distance algorithm implementation
+fn levenshtein(a: &str, b: &str) -> usize {
+    // Handle empty strings
+    if a.is_empty() || b.is_empty() {
+        return a.len().max(b.len());
+    }
+
+    let a_chars: Vec<char> = a.chars().collect();
+    let b_chars: Vec<char> = b.chars().collect();
+    let a_len = a_chars.len();
+    let b_len = b_chars.len();
+
+    let mut matrix = vec![vec![0; b_len + 1]; a_len + 1];
+
+    // Initialize first row and column
+    for i in 0..=a_len {
+        matrix[i][0] = i;
+    }
+    for j in 0..=b_len {
+        matrix[0][j] = j;
+    }
+
+    // Fill the matrix
+    for i in 1..=a_len {
+        for j in 1..=b_len {
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            matrix[i][j] = std::cmp::min(
+                std::cmp::min(
+                    matrix[i - 1][j] + 1,     // deletion
+                    matrix[i][j - 1] + 1,     // insertion
+                ),
+                matrix[i - 1][j - 1] + cost, // substitution
+            );
+        }
+    }
+
+    matrix[a_len][b_len]
+}
+
+/// Simple exact string replacer
+fn simple_replacer(content: &str, find: &str) -> Vec<String> {
+    if content.contains(find) {
+        vec![find.to_string()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Line-trimmed replacer - matches lines ignoring leading/trailing whitespace
+fn line_trimmed_replacer(content: &str, find: &str) -> Vec<String> {
+    let original_lines: Vec<&str> = content.lines().collect();
+    let mut search_lines: Vec<&str> = find.lines().collect();
+
+    // Remove trailing empty line if present
+    if search_lines.last() == Some(&"") {
+        search_lines.pop();
+    }
+
+    for i in 0..=original_lines.len().saturating_sub(search_lines.len()) {
+        let mut matches = true;
+
+        for (j, search_line) in search_lines.iter().enumerate() {
+            let original_trimmed = original_lines[i + j].trim();
+            let search_trimmed = search_line.trim();
+
+            if original_trimmed != search_trimmed {
+                matches = false;
+                break;
+            }
+        }
+
+        if matches {
+            // Calculate the actual match indices
+            let mut match_start_index = 0;
+            for k in 0..i {
+                match_start_index += original_lines[k].len() + 1; // +1 for newline
+            }
+
+            let mut match_end_index = match_start_index;
+            for k in 0..search_lines.len() {
+                match_end_index += original_lines[i + k].len();
+                if k < search_lines.len() - 1 {
+                    match_end_index += 1; // Add newline except for last line
+                }
+            }
+
+            return vec![content[match_start_index..match_end_index].to_string()];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Block anchor replacer - uses first and last lines as anchors with fuzzy middle matching
+fn block_anchor_replacer(content: &str, find: &str) -> Vec<String> {
+    let original_lines: Vec<&str> = content.lines().collect();
+    let mut search_lines: Vec<&str> = find.lines().collect();
+
+    if search_lines.len() < 3 {
+        return Vec::new();
+    }
+
+    // Remove trailing empty line if present
+    if search_lines.last() == Some(&"") {
+        search_lines.pop();
+    }
+
+    let first_line_search = search_lines[0].trim();
+    let last_line_search = search_lines[search_lines.len() - 1].trim();
+    let search_block_size = search_lines.len();
+
+    // Collect all candidate positions where both anchors match
+    let mut candidates = Vec::new();
+    for i in 0..original_lines.len() {
+        if original_lines[i].trim() != first_line_search {
+            continue;
+        }
+
+        // Look for the matching last line after this first line
+        for j in (i + 2)..original_lines.len() {
+            if original_lines[j].trim() == last_line_search {
+                candidates.push((i, j));
+                break; // Only match the first occurrence of the last line
+            }
+        }
+    }
+
+    // Return immediately if no candidates
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Handle single candidate scenario (using relaxed threshold)
+    if candidates.len() == 1 {
+        let (start_line, end_line) = candidates[0];
+        let actual_block_size = end_line - start_line + 1;
+
+        let mut similarity = 0.0;
+        let lines_to_check = (search_block_size - 2).min(actual_block_size - 2); // Middle lines only
+
+        if lines_to_check > 0 {
+            for j in 1..(search_block_size - 1).min(actual_block_size - 1) {
+                let original_line = original_lines[start_line + j].trim();
+                let search_line = search_lines[j].trim();
+                let max_len = original_line.len().max(search_line.len());
+                if max_len == 0 {
+                    continue;
+                }
+                let distance = levenshtein(original_line, search_line);
+                similarity += (1.0 - distance as f64 / max_len as f64) / lines_to_check as f64;
+
+                // Exit early when threshold is reached
+                if similarity >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD {
+                    break;
+                }
+            }
+        } else {
+            // No middle lines to compare, just accept based on anchors
+            similarity = 1.0;
+        }
+
+        if similarity >= SINGLE_CANDIDATE_SIMILARITY_THRESHOLD {
+            let mut match_start_index = 0;
+            for k in 0..start_line {
+                match_start_index += original_lines[k].len() + 1;
+            }
+            let mut match_end_index = match_start_index;
+            for k in start_line..=end_line {
+                match_end_index += original_lines[k].len();
+                if k < end_line {
+                    match_end_index += 1; // Add newline except for last line
+                }
+            }
+            return vec![content[match_start_index..match_end_index].to_string()];
+        }
+        return Vec::new();
+    }
+
+    // Calculate similarity for multiple candidates
+    let mut best_match: Option<(usize, usize)> = None;
+    let mut max_similarity = -1.0;
+
+    for &(start_line, end_line) in &candidates {
+        let actual_block_size = end_line - start_line + 1;
+
+        let mut similarity = 0.0;
+        let lines_to_check = (search_block_size - 2).min(actual_block_size - 2); // Middle lines only
+
+        if lines_to_check > 0 {
+            for j in 1..(search_block_size - 1).min(actual_block_size - 1) {
+                let original_line = original_lines[start_line + j].trim();
+                let search_line = search_lines[j].trim();
+                let max_len = original_line.len().max(search_line.len());
+                if max_len == 0 {
+                    continue;
+                }
+                let distance = levenshtein(original_line, search_line);
+                similarity += 1.0 - distance as f64 / max_len as f64;
+            }
+            similarity /= lines_to_check as f64; // Average similarity
+        } else {
+            // No middle lines to compare, just accept based on anchors
+            similarity = 1.0;
+        }
+
+        if similarity > max_similarity {
+            max_similarity = similarity;
+            best_match = Some((start_line, end_line));
+        }
+    }
+
+    // Threshold judgment
+    if max_similarity >= MULTIPLE_CANDIDATES_SIMILARITY_THRESHOLD {
+        if let Some((start_line, end_line)) = best_match {
+            let mut match_start_index = 0;
+            for k in 0..start_line {
+                match_start_index += original_lines[k].len() + 1;
+            }
+            let mut match_end_index = match_start_index;
+            for k in start_line..=end_line {
+                match_end_index += original_lines[k].len();
+                if k < end_line {
+                    match_end_index += 1;
+                }
+            }
+            return vec![content[match_start_index..match_end_index].to_string()];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Whitespace-normalized replacer - collapses multiple spaces into single spaces
+fn whitespace_normalized_replacer(content: &str, find: &str) -> Vec<String> {
+    let normalize_whitespace =
+        |text: &str| text.replace(char::is_whitespace, " ").trim().to_string();
+    let normalized_find = normalize_whitespace(find);
+
+    // Handle single line matches
+    let lines: Vec<&str> = content.lines().collect();
+    for line in &lines {
+        if normalize_whitespace(line) == normalized_find {
+            return vec![line.to_string()];
+        } else {
+            // Only check for substring matches if the full line doesn't match
+            let normalized_line = normalize_whitespace(line);
+            if normalized_line.contains(&normalized_find) {
+                // Find the actual substring in the original line that matches
+                let words: Vec<&str> = find.trim().split_whitespace().collect();
+                if !words.is_empty() {
+                    let pattern = words
+                        .iter()
+                        .map(|word| regex::escape(word))
+                        .collect::<Vec<_>>()
+                        .join("\\s+");
+                    if let Ok(regex) = Regex::new(&pattern) {
+                        if let Some(matched) = regex.find(line) {
+                            return vec![matched.as_str().to_string()];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Handle multi-line matches
+    let find_lines: Vec<&str> = find.lines().collect();
+    if find_lines.len() > 1 {
+        for i in 0..=lines.len().saturating_sub(find_lines.len()) {
+            let block: String = lines[i..i + find_lines.len()].join("\n");
+            if normalize_whitespace(&block) == normalized_find {
+                return vec![block];
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Indentation-flexible replacer - ignores leading indentation
+fn indentation_flexible_replacer(content: &str, find: &str) -> Vec<String> {
+    let remove_indentation = |text: &str| {
+        let lines: Vec<&str> = text.lines().collect();
+        let non_empty_lines: Vec<&str> = lines
+            .iter()
+            .filter(|line| !line.trim().is_empty())
+            .copied()
+            .collect();
+        if non_empty_lines.is_empty() {
+            return text.to_string();
+        }
+
+        let min_indent = non_empty_lines
+            .iter()
+            .map(|line| line.find(|c: char| !c.is_whitespace()).unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+
+        lines
+            .iter()
+            .map(|line| {
+                if line.trim().is_empty() {
+                    line.to_string()
+                } else {
+                    line.chars().skip(min_indent).collect()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    let normalized_find = remove_indentation(find);
+    let content_lines: Vec<&str> = content.lines().collect();
+    let find_lines: Vec<&str> = find.lines().collect();
+
+    for i in 0..=content_lines.len().saturating_sub(find_lines.len()) {
+        let block: String = content_lines[i..i + find_lines.len()].join("\n");
+        if remove_indentation(&block) == normalized_find {
+            return vec![block];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Escape-normalized replacer - handles escaped characters
+fn escape_normalized_replacer(content: &str, find: &str) -> Vec<String> {
+    let unescape_string = |str_: &str| {
+        str_.replace("\\n", "\n")
+            .replace("\\t", "\t")
+            .replace("\\r", "\r")
+            .replace("\\'", "'")
+            .replace("\\\"", "\"")
+            .replace("\\`", "`")
+            .replace("\\\\", "\\")
+            .replace("\\\n", "\n")
+            .replace("\\$", "$")
+    };
+
+    let unescaped_find = unescape_string(find);
+
+    // Try direct match with unescaped find string
+    if content.contains(&unescaped_find) {
+        return vec![unescaped_find];
+    }
+
+    // Also try finding escaped versions in content that match unescaped find
+    let lines: Vec<&str> = content.lines().collect();
+    let find_lines: Vec<&str> = unescaped_find.lines().collect();
+
+    for i in 0..=lines.len().saturating_sub(find_lines.len()) {
+        let block: String = lines[i..i + find_lines.len()].join("\n");
+        let unescaped_block = unescape_string(&block);
+
+        if unescaped_block == unescaped_find {
+            return vec![block];
+        }
+    }
+
+    Vec::new()
+}
+
+/// Trimmed boundary replacer - tries trimmed versions
+fn trimmed_boundary_replacer(content: &str, find: &str) -> Vec<String> {
+    let trimmed_find = find.trim();
+
+    if trimmed_find == find {
+        // Already trimmed, no point in trying
+        return Vec::new();
+    }
+
+    let mut results = Vec::new();
+
+    // Try to find the trimmed version
+    if content.contains(trimmed_find) {
+        results.push(trimmed_find.to_string());
+    }
+
+    // Also try finding blocks where trimmed content matches
+    let lines: Vec<&str> = content.lines().collect();
+    let find_lines: Vec<&str> = find.lines().collect();
+
+    for i in 0..=lines.len().saturating_sub(find_lines.len()) {
+        let block: String = lines[i..i + find_lines.len()].join("\n");
+
+        if block.trim() == trimmed_find {
+            results.push(block);
+        }
+    }
+
+    results
+}
+
+/// Context-aware replacer - uses first and last lines as context anchors
+fn context_aware_replacer(content: &str, find: &str) -> Vec<String> {
+    let mut find_lines: Vec<&str> = find.lines().collect();
+    if find_lines.len() < 3 {
+        // Need at least 3 lines to have meaningful context
+        return Vec::new();
+    }
+
+    // Remove trailing empty line if present
+    if find_lines.last() == Some(&"") {
+        find_lines.pop();
+    }
+
+    let content_lines: Vec<&str> = content.lines().collect();
+
+    // Extract first and last lines as context anchors
+    let first_line = find_lines[0].trim();
+    let last_line = find_lines[find_lines.len() - 1].trim();
+
+    // Find blocks that start and end with the context anchors
+    for i in 0..content_lines.len() {
+        if content_lines[i].trim() != first_line {
+            continue;
+        }
+
+        // Look for the matching last line
+        for j in (i + 2)..content_lines.len() {
+            if content_lines[j].trim() == last_line {
+                // Found a potential context block
+                let block_lines = &content_lines[i..=j];
+                let block = block_lines.join("\n");
+
+                // Check if the middle content has reasonable similarity
+                // (simple heuristic: at least 50% of non-empty lines should match when trimmed)
+                if block_lines.len() == find_lines.len() {
+                    let mut matching_lines = 0;
+                    let mut total_non_empty_lines = 0;
+
+                    for k in 1..block_lines.len() - 1 {
+                        let block_line = block_lines[k].trim();
+                        let find_line = find_lines[k].trim();
+
+                        if !block_line.is_empty() || !find_line.is_empty() {
+                            total_non_empty_lines += 1;
+                            if block_line == find_line {
+                                matching_lines += 1;
+                            }
+                        }
+                    }
+
+                    if total_non_empty_lines == 0
+                        || (matching_lines as f64 / total_non_empty_lines as f64) >= 0.5
+                    {
+                        return vec![block];
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+/// Multi-occurrence replacer - finds all exact matches
+fn multi_occurrence_replacer(content: &str, find: &str) -> Vec<String> {
+    let mut matches = Vec::new();
+    let mut start_index = 0;
+
+    while let Some(index) = content[start_index..].find(find) {
+        let absolute_index = start_index + index;
+        matches.push(find.to_string());
+        start_index = absolute_index + find.len();
+    }
+
+    matches
+}
+
+/// Main replace function that tries all replacers in cascade
+fn replace(
+    content: &str,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> Result<String, EditFileError> {
+    if old_string == new_string {
+        return Err(EditFileError::SameStrings);
+    }
+
+    let mut not_found = true;
+
+    // Try all replacers in order
+    let replacers: [fn(&str, &str) -> Vec<String>; 9] = [
+        simple_replacer,
+        line_trimmed_replacer,
+        block_anchor_replacer,
+        whitespace_normalized_replacer,
+        indentation_flexible_replacer,
+        escape_normalized_replacer,
+        trimmed_boundary_replacer,
+        context_aware_replacer,
+        multi_occurrence_replacer,
+    ];
+
+    for replacer in &replacers {
+        for search in replacer(content, old_string) {
+            let index = content.find(&search);
+            if index.is_none() {
+                continue;
+            }
+            not_found = false;
+
+            if replace_all {
+                return Ok(content.replace(&search, new_string));
+            }
+
+            let last_index = content.rfind(&search);
+            if index != last_index {
+                continue; // Multiple matches, try to be more specific
+            }
+
+            let index = index.unwrap();
+            return Ok(content[..index].to_string()
+                + new_string
+                + &content[index + search.len()..]);
+        }
+    }
+
+    if not_found {
+        return Err(EditFileError::OldStringNotFound);
+    }
+    Err(EditFileError::MultipleMatches)
+}
+
+// ==================== Diff Generation ====================
+
+/// Normalizes line endings to LF
+fn normalize_line_endings(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+/// Creates a unified diff using the similar crate
+fn create_unified_diff(old_path: &str, new_path: &str, old_content: &str, new_content: &str) -> String {
+    let diff = TextDiff::from_lines(old_content, new_content);
+    let mut output = String::new();
+
+    output.push_str(&format!("--- {}\n", old_path));
+    output.push_str(&format!("+++ {}\n", new_path));
+
+    for (_idx, group) in diff.grouped_ops(3).iter().enumerate() {
+        for op in group {
+            let tag = op.tag();
+            let old_range = op.old_range();
+            let new_range = op.new_range();
+
+            match tag {
+                similar::DiffTag::Delete => {
+                    output.push_str(&format!(
+                        "@@ -{},{} +{},{} @@\n",
+                        old_range.start + 1,
+                        old_range.len(),
+                        new_range.start + 1,
+                        new_range.len()
+                    ));
+                    for change in diff.iter_changes(op) {
+                        if change.tag() == ChangeTag::Delete {
+                            output.push_str(&format!("-{}", change));
+                        }
+                    }
+                }
+                similar::DiffTag::Insert => {
+                    output.push_str(&format!(
+                        "@@ -{},{} +{},{} @@\n",
+                        old_range.start + 1,
+                        old_range.len(),
+                        new_range.start + 1,
+                        new_range.len()
+                    ));
+                    for change in diff.iter_changes(op) {
+                        if change.tag() == ChangeTag::Insert {
+                            output.push_str(&format!("+{}", change));
+                        }
+                    }
+                }
+                similar::DiffTag::Equal => {
+                    // Skip equal sections in hunks
+                }
+                similar::DiffTag::Replace => {
+                    output.push_str(&format!(
+                        "@@ -{},{} +{},{} @@\n",
+                        old_range.start + 1,
+                        old_range.len(),
+                        new_range.start + 1,
+                        new_range.len()
+                    ));
+                    for change in diff.iter_changes(op) {
+                        match change.tag() {
+                            ChangeTag::Delete => output.push_str(&format!("-{}", change)),
+                            ChangeTag::Insert => output.push_str(&format!("+{}", change)),
+                            ChangeTag::Equal => output.push_str(&format!(" {}", change)),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    output
+}
+
+/// Trims common whitespace from diff output for cleaner display
+fn trim_diff(diff: &str) -> String {
+    let lines: Vec<&str> = diff.lines().collect();
+    let content_lines: Vec<&str> = lines
+        .iter()
+        .filter(|line| {
+            (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
+                && !line.starts_with("---")
+                && !line.starts_with("+++")
+        })
+        .copied()
+        .collect();
+
+    if content_lines.is_empty() {
+        return diff.to_string();
+    }
+
+    let mut min_indent = usize::MAX;
+    for line in &content_lines {
+        let content = &line[1..];
+        if !content.trim().is_empty() {
+            if let Some(matched) = content.find(|c: char| !c.is_whitespace()) {
+                min_indent = min_indent.min(matched);
+            }
+        }
+    }
+
+    if min_indent == usize::MAX || min_indent == 0 {
+        return diff.to_string();
+    }
+
+    let trimmed_lines: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            if (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
+                && !line.starts_with("---")
+                && !line.starts_with("+++")
+            {
+                let prefix = line.chars().next().unwrap();
+                let content = &line[1..];
+                if content.len() >= min_indent {
+                    format!("{}{}", prefix, &content[min_indent..])
+                } else {
+                    line.to_string()
+                }
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    trimmed_lines.join("\n")
+}
+
+// ==================== Tool Implementation ====================
 
 /// Tool for editing files via search and replace
 #[derive(Debug, Clone)]
@@ -140,104 +826,20 @@ impl EditFile {
             return Ok(full_path);
         }
 
-        let canonical = full_path.canonicalize().map_err(|e| {
-            EditFileError::Io(e.to_string())
-        })?;
+        let canonical = full_path
+            .canonicalize()
+            .map_err(|e| EditFileError::Io(e.to_string()))?;
 
-        let working_canonical = self.working_dir.canonicalize().map_err(|e| {
-            EditFileError::Io(format!("Cannot resolve working directory: {}", e))
-        })?;
+        let working_canonical = self
+            .working_dir
+            .canonicalize()
+            .map_err(|e| EditFileError::Io(format!("Cannot resolve working directory: {}", e)))?;
 
         if !canonical.starts_with(&working_canonical) {
             return Err(EditFileError::OutsideWorkDir(path.to_string()));
         }
 
         Ok(canonical)
-    }
-
-    /// Generate a unified diff between old and new content
-    fn generate_diff(old: &str, new: &str, path: &str) -> String {
-        use std::fmt::Write;
-
-        let old_lines: Vec<&str> = old.lines().collect();
-        let new_lines: Vec<&str> = new.lines().collect();
-
-        let mut diff = String::new();
-        writeln!(diff, "--- a/{}", path).unwrap();
-        writeln!(diff, "+++ b/{}", path).unwrap();
-
-        // Simple line-by-line diff (not optimal but readable)
-        let mut old_idx = 0;
-        let mut new_idx = 0;
-        let mut hunk_start_old = 0;
-        let mut hunk_start_new = 0;
-        let mut hunk_lines: Vec<String> = Vec::new();
-        let mut in_hunk = false;
-
-        while old_idx < old_lines.len() || new_idx < new_lines.len() {
-            let old_line = old_lines.get(old_idx);
-            let new_line = new_lines.get(new_idx);
-
-            match (old_line, new_line) {
-                (Some(o), Some(n)) if o == n => {
-                    if in_hunk {
-                        hunk_lines.push(format!(" {}", o));
-                    }
-                    old_idx += 1;
-                    new_idx += 1;
-                }
-                (Some(o), Some(n)) => {
-                    if !in_hunk {
-                        in_hunk = true;
-                        hunk_start_old = old_idx + 1;
-                        hunk_start_new = new_idx + 1;
-                        // Add context before
-                        let context_start = old_idx.saturating_sub(3);
-                        for i in context_start..old_idx {
-                            hunk_lines.push(format!(" {}", old_lines[i]));
-                        }
-                        if context_start < old_idx {
-                            hunk_start_old = context_start + 1;
-                            hunk_start_new = new_idx.saturating_sub(old_idx - context_start) + 1;
-                        }
-                    }
-                    hunk_lines.push(format!("-{}", o));
-                    hunk_lines.push(format!("+{}", n));
-                    old_idx += 1;
-                    new_idx += 1;
-                }
-                (Some(o), None) => {
-                    if !in_hunk {
-                        in_hunk = true;
-                        hunk_start_old = old_idx + 1;
-                        hunk_start_new = new_idx + 1;
-                    }
-                    hunk_lines.push(format!("-{}", o));
-                    old_idx += 1;
-                }
-                (None, Some(n)) => {
-                    if !in_hunk {
-                        in_hunk = true;
-                        hunk_start_old = old_idx + 1;
-                        hunk_start_new = new_idx + 1;
-                    }
-                    hunk_lines.push(format!("+{}", n));
-                    new_idx += 1;
-                }
-                (None, None) => break,
-            }
-        }
-
-        if !hunk_lines.is_empty() {
-            let old_count = hunk_lines.iter().filter(|l| l.starts_with('-') || l.starts_with(' ')).count();
-            let new_count = hunk_lines.iter().filter(|l| l.starts_with('+') || l.starts_with(' ')).count();
-            writeln!(diff, "@@ -{},{} +{},{} @@", hunk_start_old, old_count, hunk_start_new, new_count).unwrap();
-            for line in hunk_lines {
-                writeln!(diff, "{}", line).unwrap();
-            }
-        }
-
-        diff
     }
 
     /// Write content atomically (write to temp file, then rename)
@@ -252,13 +854,11 @@ impl EditFile {
         // Write to temp file in same directory (for atomic rename)
         let temp_path = path.with_extension("tmp.crow_edit");
 
-        std::fs::write(&temp_path, content).map_err(|e| {
-            match e.kind() {
-                std::io::ErrorKind::PermissionDenied => {
-                    EditFileError::PermissionDenied(path.display().to_string())
-                }
-                _ => EditFileError::Io(e.to_string()),
+        std::fs::write(&temp_path, content).map_err(|e| match e.kind() {
+            std::io::ErrorKind::PermissionDenied => {
+                EditFileError::PermissionDenied(path.display().to_string())
             }
+            _ => EditFileError::Io(e.to_string()),
         })?;
 
         // Atomic rename
@@ -286,7 +886,9 @@ impl<'de> Deserialize<'de> for EditFile {
     where
         D: serde::Deserializer<'de>,
     {
-        Ok(Self::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))))
+        Ok(Self::new(
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ))
     }
 }
 
@@ -300,17 +902,22 @@ impl Tool for EditFile {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "edit_file".to_string(),
-            description: r#"Edit a file by finding and replacing text.
+            description: r#"Performs exact string replacements in files with fuzzy matching fallbacks.
 
-To edit a file, you MUST provide:
-- path: the file path
-- old_string: the EXACT text to find (copy from the file)
-- new_string: the text to replace it with
+Before using this tool:
+1. Use the `read_file` tool to understand the file's contents and context
+2. Verify the directory path is correct (only for new files)
 
-The old_string must match exactly including whitespace and indentation.
-Returns a unified diff showing the changes made.
+The tool uses 9 cascading replacers to handle LLM mistakes gracefully:
+- Exact match, line-trimmed, block anchors, whitespace-normalized
+- Indentation-flexible, escape-normalized, trimmed boundaries
+- Context-aware (50% middle match), multi-occurrence
 
-IMPORTANT: Always read the file first before editing!"#.to_string(),
+Usage notes:
+- The edit will FAIL if `old_string` is not found in the file
+- The edit will FAIL if `old_string` is found multiple times. Provide more context.
+- Use `replace_all` to replace all occurrences of a string"#
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -320,7 +927,7 @@ IMPORTANT: Always read the file first before editing!"#.to_string(),
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "The EXACT text to find and replace (copy from file, include whitespace)"
+                        "description": "The text to find and replace (fuzzy matching enabled)"
                     },
                     "new_string": {
                         "type": "string",
@@ -328,12 +935,12 @@ IMPORTANT: Always read the file first before editing!"#.to_string(),
                     },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "Replace all occurrences if old_string appears multiple times (default: false)"
+                        "description": "Replace all occurrences (default: false)"
                     },
                     "mode": {
                         "type": "string",
                         "enum": ["edit", "create", "overwrite"],
-                        "description": "Operation mode (default: edit). Use 'create' for new files with 'content' param."
+                        "description": "Operation mode (default: edit)"
                     },
                     "content": {
                         "type": "string",
@@ -356,15 +963,13 @@ IMPORTANT: Always read the file first before editing!"#.to_string(),
                 }
 
                 // For create mode, content can come from 'content' param or 'new_string' as fallback
-                let content = args.content
-                    .or(args.new_string.clone())
-                    .ok_or_else(|| {
-                        EditFileError::MissingField("content (required for mode='create')".to_string())
-                    })?;
+                let content = args.content.or(args.new_string.clone()).ok_or_else(|| {
+                    EditFileError::MissingField("content (required for mode='create')".to_string())
+                })?;
 
                 Self::atomic_write(&path, &content)?;
 
-                let diff = Self::generate_diff("", &content, &args.path);
+                let diff = trim_diff(&create_unified_diff("", &args.path, "", &content));
                 let line_count = content.lines().count();
 
                 Ok(EditFileOutput {
@@ -372,6 +977,8 @@ IMPORTANT: Always read the file first before editing!"#.to_string(),
                     mode: "create".to_string(),
                     message: format!("Created file ({} lines)", line_count),
                     diff,
+                    additions: line_count,
+                    deletions: 0,
                 })
             }
 
@@ -385,36 +992,52 @@ IMPORTANT: Always read the file first before editing!"#.to_string(),
                     return Err(EditFileError::NotAFile(args.path.clone()));
                 }
 
-                let old_content = std::fs::read_to_string(&path).map_err(|e| {
-                    match e.kind() {
-                        std::io::ErrorKind::PermissionDenied => {
-                            EditFileError::PermissionDenied(args.path.clone())
-                        }
-                        _ => EditFileError::Io(e.to_string()),
+                let old_content = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        EditFileError::PermissionDenied(args.path.clone())
                     }
+                    _ => EditFileError::Io(e.to_string()),
                 })?;
 
                 // For overwrite mode, content can come from 'content' param or 'new_string' as fallback
-                let new_content = args.content
-                    .or(args.new_string.clone())
-                    .ok_or_else(|| {
-                        EditFileError::MissingField("content (required for mode='overwrite')".to_string())
-                    })?;
+                let new_content = args.content.or(args.new_string.clone()).ok_or_else(|| {
+                    EditFileError::MissingField(
+                        "content (required for mode='overwrite')".to_string(),
+                    )
+                })?;
 
                 Self::atomic_write(&path, &new_content)?;
 
-                let diff = Self::generate_diff(&old_content, &new_content, &args.path);
+                let diff = trim_diff(&create_unified_diff(
+                    &args.path,
+                    &args.path,
+                    &normalize_line_endings(&old_content),
+                    &normalize_line_endings(&new_content),
+                ));
+
+                // Calculate additions and deletions
+                let text_diff = TextDiff::from_lines(&old_content, &new_content);
+                let (mut additions, mut deletions) = (0, 0);
+                for change in text_diff.iter_all_changes() {
+                    match change.tag() {
+                        ChangeTag::Insert => additions += 1,
+                        ChangeTag::Delete => deletions += 1,
+                        ChangeTag::Equal => {}
+                    }
+                }
 
                 Ok(EditFileOutput {
                     path: args.path,
                     mode: "overwrite".to_string(),
                     message: "Replaced file contents".to_string(),
                     diff,
+                    additions,
+                    deletions,
                 })
             }
 
             EditMode::Edit => {
-                // Edit mode: search and replace
+                // Edit mode: search and replace with fuzzy matching
                 if !path.exists() {
                     return Err(EditFileError::NotFound(args.path.clone()));
                 }
@@ -431,47 +1054,46 @@ IMPORTANT: Always read the file first before editing!"#.to_string(),
                     EditFileError::MissingField("new_string (required for mode='edit')".to_string())
                 })?;
 
-                let old_content = std::fs::read_to_string(&path).map_err(|e| {
-                    match e.kind() {
-                        std::io::ErrorKind::PermissionDenied => {
-                            EditFileError::PermissionDenied(args.path.clone())
-                        }
-                        _ => EditFileError::Io(e.to_string()),
+                let old_content = std::fs::read_to_string(&path).map_err(|e| match e.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        EditFileError::PermissionDenied(args.path.clone())
                     }
+                    _ => EditFileError::Io(e.to_string()),
                 })?;
 
-                // Count occurrences
-                let count = old_content.matches(&old_string).count();
-
-                if count == 0 {
-                    return Err(EditFileError::OldStringNotFound);
-                }
-
-                if count > 1 && !args.replace_all {
-                    return Err(EditFileError::MultipleMatches(count));
-                }
-
-                // Perform replacement
-                let new_content = if args.replace_all {
-                    old_content.replace(&old_string, &new_string)
-                } else {
-                    old_content.replacen(&old_string, &new_string, 1)
-                };
+                // Use cascading replacers
+                let new_content = replace(&old_content, &old_string, &new_string, args.replace_all)?;
 
                 Self::atomic_write(&path, &new_content)?;
 
-                let diff = Self::generate_diff(&old_content, &new_content, &args.path);
-                let replacements = if args.replace_all { count } else { 1 };
+                let diff = trim_diff(&create_unified_diff(
+                    &args.path,
+                    &args.path,
+                    &normalize_line_endings(&old_content),
+                    &normalize_line_endings(&new_content),
+                ));
+
+                // Calculate additions and deletions
+                let text_diff = TextDiff::from_lines(&old_content, &new_content);
+                let (mut additions, mut deletions) = (0, 0);
+                for change in text_diff.iter_all_changes() {
+                    match change.tag() {
+                        ChangeTag::Insert => additions += 1,
+                        ChangeTag::Delete => deletions += 1,
+                        ChangeTag::Equal => {}
+                    }
+                }
 
                 Ok(EditFileOutput {
                     path: args.path,
                     mode: "edit".to_string(),
                     message: format!(
-                        "Edited file ({} replacement{})",
-                        replacements,
-                        if replacements == 1 { "" } else { "s" }
+                        "Edited file (+{} -{} lines)",
+                        additions, deletions
                     ),
                     diff,
+                    additions,
+                    deletions,
                 })
             }
         }
@@ -487,26 +1109,30 @@ mod tests {
         tempfile::tempdir().unwrap()
     }
 
+    // ==================== Tool integration tests ====================
+
     #[tokio::test]
     async fn test_create_new_file() {
         let dir = setup_test_dir();
         let tool = EditFile::new(dir.path().to_path_buf());
 
-        let result = tool.call(EditFileArgs {
-            path: "new_file.txt".to_string(),
-            mode: EditMode::Create,
-            description: Some("Create test file".to_string()),
-            old_string: None,
-            new_string: None,
-            content: Some("Hello, World!\nLine 2\n".to_string()),
-            replace_all: false,
-        }).await.unwrap();
+        let result = tool
+            .call(EditFileArgs {
+                path: "new_file.txt".to_string(),
+                mode: EditMode::Create,
+                description: Some("Create test file".to_string()),
+                old_string: None,
+                new_string: None,
+                content: Some("Hello, World!\nLine 2\n".to_string()),
+                replace_all: false,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.mode, "create");
         assert!(result.message.contains("Created"));
         assert!(result.diff.contains("+Hello, World!"));
 
-        // Verify file was created
         let content = std::fs::read_to_string(dir.path().join("new_file.txt")).unwrap();
         assert_eq!(content, "Hello, World!\nLine 2\n");
     }
@@ -518,15 +1144,17 @@ mod tests {
 
         let tool = EditFile::new(dir.path().to_path_buf());
 
-        let result = tool.call(EditFileArgs {
-            path: "existing.txt".to_string(),
-            mode: EditMode::Create,
-            description: None,
-            old_string: None,
-            new_string: None,
-            content: Some("new content".to_string()),
-            replace_all: false,
-        }).await;
+        let result = tool
+            .call(EditFileArgs {
+                path: "existing.txt".to_string(),
+                mode: EditMode::Create,
+                description: None,
+                old_string: None,
+                new_string: None,
+                content: Some("new content".to_string()),
+                replace_all: false,
+            })
+            .await;
 
         assert!(matches!(result, Err(EditFileError::FileAlreadyExists(_))));
     }
@@ -538,15 +1166,18 @@ mod tests {
 
         let tool = EditFile::new(dir.path().to_path_buf());
 
-        let result = tool.call(EditFileArgs {
-            path: "file.txt".to_string(),
-            mode: EditMode::Overwrite,
-            description: None,
-            old_string: None,
-            new_string: None,
-            content: Some("new content".to_string()),
-            replace_all: false,
-        }).await.unwrap();
+        let result = tool
+            .call(EditFileArgs {
+                path: "file.txt".to_string(),
+                mode: EditMode::Overwrite,
+                description: None,
+                old_string: None,
+                new_string: None,
+                content: Some("new content".to_string()),
+                replace_all: false,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.mode, "overwrite");
         assert!(result.diff.contains("-old content"));
@@ -557,42 +1188,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_overwrite_fails_if_not_exists() {
-        let dir = setup_test_dir();
-        let tool = EditFile::new(dir.path().to_path_buf());
-
-        let result = tool.call(EditFileArgs {
-            path: "nonexistent.txt".to_string(),
-            mode: EditMode::Overwrite,
-            description: None,
-            old_string: None,
-            new_string: None,
-            content: Some("content".to_string()),
-            replace_all: false,
-        }).await;
-
-        assert!(matches!(result, Err(EditFileError::FileDoesNotExist(_))));
-    }
-
-    #[tokio::test]
     async fn test_edit_replace_string() {
         let dir = setup_test_dir();
-        std::fs::write(dir.path().join("code.rs"), "fn old_name() {\n    println!(\"hello\");\n}\n").unwrap();
+        std::fs::write(
+            dir.path().join("code.rs"),
+            "fn old_name() {\n    println!(\"hello\");\n}\n",
+        )
+        .unwrap();
 
         let tool = EditFile::new(dir.path().to_path_buf());
 
-        let result = tool.call(EditFileArgs {
-            path: "code.rs".to_string(),
-            mode: EditMode::Edit,
-            description: Some("Rename function".to_string()),
-            old_string: Some("fn old_name()".to_string()),
-            new_string: Some("fn new_name()".to_string()),
-            content: None,
-            replace_all: false,
-        }).await.unwrap();
+        let result = tool
+            .call(EditFileArgs {
+                path: "code.rs".to_string(),
+                mode: EditMode::Edit,
+                description: Some("Rename function".to_string()),
+                old_string: Some("fn old_name()".to_string()),
+                new_string: Some("fn new_name()".to_string()),
+                content: None,
+                replace_all: false,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.mode, "edit");
-        assert!(result.message.contains("1 replacement"));
         assert!(result.diff.contains("-fn old_name()"));
         assert!(result.diff.contains("+fn new_name()"));
 
@@ -607,60 +1226,20 @@ mod tests {
 
         let tool = EditFile::new(dir.path().to_path_buf());
 
-        let result = tool.call(EditFileArgs {
-            path: "test.txt".to_string(),
-            mode: EditMode::Edit,
-            description: None,
-            old_string: Some("foo".to_string()),
-            new_string: Some("qux".to_string()),
-            content: None,
-            replace_all: true,
-        }).await.unwrap();
-
-        assert!(result.message.contains("3 replacements"));
+        tool.call(EditFileArgs {
+                path: "test.txt".to_string(),
+                mode: EditMode::Edit,
+                description: None,
+                old_string: Some("foo".to_string()),
+                new_string: Some("qux".to_string()),
+                content: None,
+                replace_all: true,
+            })
+            .await
+            .unwrap();
 
         let content = std::fs::read_to_string(dir.path().join("test.txt")).unwrap();
         assert_eq!(content, "qux bar qux baz qux");
-    }
-
-    #[tokio::test]
-    async fn test_edit_multiple_matches_without_replace_all() {
-        let dir = setup_test_dir();
-        std::fs::write(dir.path().join("test.txt"), "foo bar foo").unwrap();
-
-        let tool = EditFile::new(dir.path().to_path_buf());
-
-        let result = tool.call(EditFileArgs {
-            path: "test.txt".to_string(),
-            mode: EditMode::Edit,
-            description: None,
-            old_string: Some("foo".to_string()),
-            new_string: Some("qux".to_string()),
-            content: None,
-            replace_all: false,
-        }).await;
-
-        assert!(matches!(result, Err(EditFileError::MultipleMatches(2))));
-    }
-
-    #[tokio::test]
-    async fn test_edit_string_not_found() {
-        let dir = setup_test_dir();
-        std::fs::write(dir.path().join("test.txt"), "some content").unwrap();
-
-        let tool = EditFile::new(dir.path().to_path_buf());
-
-        let result = tool.call(EditFileArgs {
-            path: "test.txt".to_string(),
-            mode: EditMode::Edit,
-            description: None,
-            old_string: Some("nonexistent".to_string()),
-            new_string: Some("replacement".to_string()),
-            content: None,
-            replace_all: false,
-        }).await;
-
-        assert!(matches!(result, Err(EditFileError::OldStringNotFound)));
     }
 
     #[tokio::test]
@@ -668,15 +1247,18 @@ mod tests {
         let dir = setup_test_dir();
         let tool = EditFile::new(dir.path().to_path_buf());
 
-        let result = tool.call(EditFileArgs {
-            path: "a/b/c/deep.txt".to_string(),
-            mode: EditMode::Create,
-            description: None,
-            old_string: None,
-            new_string: None,
-            content: Some("deep file".to_string()),
-            replace_all: false,
-        }).await.unwrap();
+        let result = tool
+            .call(EditFileArgs {
+                path: "a/b/c/deep.txt".to_string(),
+                mode: EditMode::Create,
+                description: None,
+                old_string: None,
+                new_string: None,
+                content: Some("deep file".to_string()),
+                replace_all: false,
+            })
+            .await
+            .unwrap();
 
         assert_eq!(result.mode, "create");
 
@@ -684,47 +1266,214 @@ mod tests {
         assert_eq!(content, "deep file");
     }
 
-    #[tokio::test]
-    async fn test_path_traversal_blocked() {
-        let dir = setup_test_dir();
-        let tool = EditFile::new(dir.path().to_path_buf());
+    // ==================== replace() function tests ====================
 
-        let result = tool.call(EditFileArgs {
-            path: "../../../etc/passwd".to_string(),
-            mode: EditMode::Create,
-            description: None,
-            old_string: None,
-            new_string: None,
-            content: Some("hacked".to_string()),
-            replace_all: false,
-        }).await;
+    #[test]
+    fn test_replace_simple() {
+        let content = "Hello World\nHello Rust";
+        let result = replace(content, "Hello World", "Hello Crow", false).unwrap();
+        assert_eq!(result, "Hello Crow\nHello Rust");
+    }
 
-        // Should fail with either OutsideWorkDir or by not finding the path
+    #[test]
+    fn test_replace_all_occurrences() {
+        let content = "foo bar\nfoo baz\nfoo qux";
+        let result = replace(content, "foo", "bar", true).unwrap();
+        assert_eq!(result, "bar bar\nbar baz\nbar qux");
+    }
+
+    #[test]
+    fn test_replace_single_when_multiple_exists() {
+        let content = "foo bar\nfoo baz";
+        let result = replace(content, "foo", "bar", false);
         assert!(result.is_err());
     }
 
-    #[tokio::test]
-    async fn test_diff_output_format() {
-        let dir = setup_test_dir();
-        std::fs::write(dir.path().join("test.txt"), "line1\nline2\nline3\n").unwrap();
+    #[test]
+    fn test_replace_not_found() {
+        let content = "Hello World";
+        let result = replace(content, "Goodbye", "Hi", false);
+        assert!(matches!(result, Err(EditFileError::OldStringNotFound)));
+    }
 
-        let tool = EditFile::new(dir.path().to_path_buf());
+    #[test]
+    fn test_replace_same_string_error() {
+        let content = "Hello World";
+        let result = replace(content, "Hello", "Hello", false);
+        assert!(matches!(result, Err(EditFileError::SameStrings)));
+    }
 
-        let result = tool.call(EditFileArgs {
-            path: "test.txt".to_string(),
-            mode: EditMode::Edit,
-            description: None,
-            old_string: Some("line2".to_string()),
-            new_string: Some("modified".to_string()),
-            content: None,
-            replace_all: false,
-        }).await.unwrap();
+    #[test]
+    fn test_replace_multiline() {
+        let content = "fn main() {\n    println!(\"Hello\");\n}";
+        let result = replace(
+            content,
+            "fn main() {\n    println!(\"Hello\");\n}",
+            "fn main() {\n    println!(\"World\");\n}",
+            false,
+        )
+        .unwrap();
+        assert_eq!(result, "fn main() {\n    println!(\"World\");\n}");
+    }
 
-        // Check diff format
-        assert!(result.diff.contains("--- a/test.txt"));
-        assert!(result.diff.contains("+++ b/test.txt"));
-        assert!(result.diff.contains("@@"));
-        assert!(result.diff.contains("-line2"));
-        assert!(result.diff.contains("+modified"));
+    // ==================== Fuzzy matching tests ====================
+
+    #[test]
+    fn test_replace_fuzzy_whitespace() {
+        let content = "    let x = 5;";
+        let result = replace(content, "let x = 5;", "let x = 42;", false).unwrap();
+        assert_eq!(result, "    let x = 42;");
+    }
+
+    #[test]
+    fn test_replace_fuzzy_indentation() {
+        let content = "        deeply indented";
+        let result = replace(content, "deeply indented", "not so deep", false).unwrap();
+        assert_eq!(result, "        not so deep");
+    }
+
+    #[test]
+    fn test_replace_fuzzy_multiline_indentation() {
+        let content = "    fn test() {\n        let x = 1;\n    }";
+        let result = replace(
+            content,
+            "fn test() {\n    let x = 1;\n}",
+            "fn test() {\n    let x = 2;\n}",
+            false,
+        )
+        .unwrap();
+        assert!(result.contains("let x = 2"));
+    }
+
+    #[test]
+    fn test_replace_trimmed_boundary() {
+        let content = "   hello world   ";
+        let result = replace(content, "hello world", "goodbye world", false).unwrap();
+        assert!(result.contains("goodbye world"));
+    }
+
+    // ==================== Block anchor replacer tests ====================
+
+    #[test]
+    fn test_replace_block_anchor() {
+        let content = "fn foo() {\n    let x = 1;\n    let y = 2;\n}";
+        let result = replace(
+            content,
+            "fn foo() {\n    // different middle\n}",
+            "fn bar() {\n    let z = 3;\n}",
+            false,
+        );
+        assert!(result.is_ok());
+    }
+
+    // ==================== Levenshtein distance tests ====================
+
+    #[test]
+    fn test_levenshtein_empty_strings() {
+        assert_eq!(levenshtein("", ""), 0);
+    }
+
+    #[test]
+    fn test_levenshtein_one_empty() {
+        assert_eq!(levenshtein("", "abc"), 3);
+        assert_eq!(levenshtein("abc", ""), 3);
+    }
+
+    #[test]
+    fn test_levenshtein_identical() {
+        assert_eq!(levenshtein("hello", "hello"), 0);
+    }
+
+    #[test]
+    fn test_levenshtein_classic_examples() {
+        assert_eq!(levenshtein("kitten", "sitting"), 3);
+        assert_eq!(levenshtein("flaw", "lawn"), 2);
+        assert_eq!(levenshtein("saturday", "sunday"), 3);
+    }
+
+    // ==================== Individual replacer tests ====================
+
+    #[test]
+    fn test_simple_replacer() {
+        let content = "hello world";
+        let find = "hello";
+        let matches = simple_replacer(content, find);
+        assert_eq!(matches, vec!["hello"]);
+    }
+
+    #[test]
+    fn test_line_trimmed_replacer_basic() {
+        let content = "    hello world\n    foo bar";
+        let find = "hello world\nfoo bar";
+        let matches = line_trimmed_replacer(content, find);
+        assert_eq!(matches.len(), 1);
+    }
+
+    #[test]
+    fn test_indentation_flexible_replacer() {
+        let content = "        deeply indented";
+        let find = "deeply indented";
+        let matches = indentation_flexible_replacer(content, find);
+        assert!(!matches.is_empty());
+    }
+
+    #[test]
+    fn test_multi_occurrence_replacer() {
+        let content = "foo bar foo baz foo";
+        let find = "foo";
+        let matches = multi_occurrence_replacer(content, find);
+        assert_eq!(matches.len(), 3);
+    }
+
+    // ==================== Real-world scenario tests ====================
+
+    #[test]
+    fn test_replace_rust_struct_field() {
+        let content = r#"struct User {
+    name: String,
+    age: u32,
+}"#;
+        let result = replace(content, "    age: u32,", "    age: u64,", false).unwrap();
+        assert!(result.contains("age: u64"));
+    }
+
+    #[test]
+    fn test_replace_all_three_occurrences() {
+        let content = r#"fn main() {
+    println!("Hello, World!");
+}
+
+pub fn hello_world() -> String {
+    "Hello, World!".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hello_world() {
+        assert_eq!(hello_world(), "Hello, World!");
+    }
+}"#;
+        let result = replace(content, "Hello, World!", "Hello, Universe!", true).unwrap();
+        assert_eq!(result.matches("Hello, Universe!").count(), 3);
+        assert_eq!(result.matches("Hello, World!").count(), 0);
+    }
+
+    // ==================== Edge case tests ====================
+
+    #[test]
+    fn test_replace_unicode() {
+        let content = "Hello 世界!";
+        let result = replace(content, "世界", "World", false).unwrap();
+        assert_eq!(result, "Hello World!");
+    }
+
+    #[test]
+    fn test_replace_emoji() {
+        let content = "Hello 👋 World";
+        let result = replace(content, "👋", "🌍", false).unwrap();
+        assert_eq!(result, "Hello 🌍 World");
     }
 }

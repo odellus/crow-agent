@@ -212,27 +212,15 @@ impl Tool for Grep {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "grep".to_string(),
-            description: r#"Search for a regex pattern in files.
+            description: r#"Searches the contents of files in the project with a regular expression
 
-Use this to find code, definitions, usages, etc.
-Results show file path, line number, and matching line.
-
-Features:
-- Regex patterns with full syntax support
-- Case-sensitive or insensitive search
-- Glob patterns to filter files (e.g., "*.rs", "**/*.ts")
-- Pagination: 20 results per page, use `offset` for more
-- Context lines before/after matches
-
-Automatically skips:
-- Hidden files/directories (starting with .)
-- Common build directories (node_modules, target, .git, etc.)
-- Binary files
-
-Examples:
-- Find function definitions: pattern="fn \w+\("
-- Find imports: pattern="^import|^use"
-- Find TODOs: pattern="TODO|FIXME""#.to_string(),
+- Prefer this tool to path search when searching for symbols in the project, because you won't need to guess what path it's in.
+- Supports full regex syntax (eg. "log.*Error", "function\\s+\\w+", etc.)
+- Pass an `include_pattern` if you know how to narrow your search on the files system
+- Never use this tool to search for paths. Only search file contents with this tool.
+- Use this tool when you need to find files containing specific patterns
+- Results are paginated with 20 matches per page. Use the optional 'offset' parameter to request subsequent pages.
+- DO NOT use HTML entities solely to escape characters in the tool parameters."#.to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {

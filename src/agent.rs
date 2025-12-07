@@ -6,11 +6,12 @@ use crate::telemetry::Telemetry;
 use crate::templates::{ProjectContext, SystemPromptTemplate, Templates, WorktreeContext};
 use crate::tools::*;
 use anyhow::Result;
-use rig::agent::Agent;
+use rig::agent::{Agent, StreamingPromptRequest};
+use rig::client::{CompletionClient, ProviderClient};
 use rig::completion::Prompt;
 use rig::message::Message;
 use rig::providers::openrouter;
-use rig::client::{CompletionClient, ProviderClient};
+use rig::streaming::StreamingPrompt;
 
 /// Maximum number of tool-call rounds before stopping
 const MAX_TOOL_TURNS: usize = 20;
@@ -243,4 +244,30 @@ impl CrowAgent {
     pub fn working_dir(&self) -> &PathBuf {
         &self.working_dir
     }
+
+    /// Run a streaming multi-turn chat session
+    /// Returns a tuple of (stream request, hook) - the hook can be used for cancellation
+    pub async fn chat_stream(
+        &self,
+        message: &str,
+        history: Vec<Message>,
+    ) -> Result<(StreamingPromptRequest<openrouter::CompletionModel, TelemetryHook>, TelemetryHook)> {
+        self.telemetry.log_user_message(message).await;
+
+        let agent = self.build_agent()?;
+        let hook = TelemetryHook::new(self.telemetry.clone());
+        let hook_clone = hook.clone();
+
+        let request = agent
+            .stream_prompt(message)
+            .with_history(history)
+            .with_hook(hook)
+            .multi_turn(MAX_TOOL_TURNS);
+
+        Ok((request, hook_clone))
+    }
 }
+
+/// Re-export streaming types for use in ACP layer
+pub use rig::agent::MultiTurnStreamItem;
+pub use rig::streaming::StreamedAssistantContent;
