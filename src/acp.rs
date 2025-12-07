@@ -21,7 +21,7 @@ use std::collections::HashMap;
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use rig::agent::MultiTurnStreamItem;
 use rig::message::{AssistantContent, Message, Text, UserContent};
@@ -192,8 +192,62 @@ impl acp::Agent for CrowAcpAgent {
                 // Await the request to get the actual stream
                 let mut stream = stream_request.await;
 
-                // Accumulate the assistant's response for history
-                let mut accumulated_response = String::new();
+                // Accumulate EVERYTHING for history - on cancel we need to save all of this
+                // This mirrors what rig does internally during multi_turn
+                let mut accumulated_text = String::new();
+                let mut accumulated_tool_calls: Vec<rig::message::ToolCall> = Vec::new();
+                let mut accumulated_tool_results: Vec<rig::message::ToolResult> = Vec::new();
+
+                // Helper to save accumulated state to history
+                // ALWAYS saves the user message, even if assistant hadn't responded yet
+                let save_history = |sessions: &RefCell<HashMap<String, Session>>,
+                                   session_id: &str,
+                                   prompt_text: &str,
+                                   text: &str,
+                                   tool_calls: &[rig::message::ToolCall],
+                                   tool_results: &[rig::message::ToolResult]| {
+                    let sessions_ref = sessions.borrow();
+                    if let Some(session) = sessions_ref.get(session_id) {
+                        let mut history = session.history.borrow_mut();
+
+                        // ALWAYS add user message - even if cancelled before assistant responded
+                        history.push(Message::User {
+                            content: OneOrMany::one(UserContent::text(prompt_text)),
+                        });
+
+                        // Build assistant content - can have both text and tool calls
+                        let mut assistant_content: Vec<AssistantContent> = Vec::new();
+
+                        if !text.is_empty() {
+                            assistant_content.push(AssistantContent::Text(Text {
+                                text: text.to_string(),
+                            }));
+                        }
+
+                        for tc in tool_calls {
+                            assistant_content.push(AssistantContent::ToolCall(tc.clone()));
+                        }
+
+                        // Only add assistant message if there's content
+                        if !assistant_content.is_empty() {
+                            history.push(Message::Assistant {
+                                id: None,
+                                content: OneOrMany::many(assistant_content)
+                                    .expect("we checked it's not empty"),
+                            });
+                        }
+
+                        // Add tool results as user messages
+                        for result in tool_results {
+                            history.push(Message::User {
+                                content: OneOrMany::one(UserContent::ToolResult(result.clone())),
+                            });
+                        }
+
+                        info!("Saved history: {} chars text, {} tool calls, {} results, now {} messages",
+                              text.len(), tool_calls.len(), tool_results.len(), history.len());
+                    }
+                };
 
                 // Process stream items and send updates
                 while let Some(item) = stream.next().await {
@@ -203,8 +257,15 @@ impl acp::Agent for CrowAcpAgent {
                         if let Some(session) = sessions.get(&session_id) {
                             if session.cancelled.get() {
                                 info!("Session {} was cancelled, breaking stream loop", session_id);
-                                // Clear the active hook
                                 *session.active_hook.borrow_mut() = None;
+                                drop(sessions);
+
+                                // Save everything we accumulated before cancellation
+                                save_history(
+                                    &self.sessions, &session_id, &prompt_text,
+                                    &accumulated_text, &accumulated_tool_calls, &accumulated_tool_results
+                                );
+
                                 return Ok(PromptResponse::new(StopReason::Cancelled));
                             }
                         }
@@ -215,7 +276,8 @@ impl acp::Agent for CrowAcpAgent {
                             match content {
                                 StreamedAssistantContent::Text(text) => {
                                     // Accumulate text for history
-                                    accumulated_response.push_str(&text.text);
+                                    accumulated_text.push_str(&text.text);
+                                    debug!("Accumulated {} chars (total: {})", text.text.len(), accumulated_text.len());
 
                                     // Stream text chunks immediately
                                     self.send_update(SessionNotification::new(
@@ -227,9 +289,11 @@ impl acp::Agent for CrowAcpAgent {
                                     .await?;
                                 }
                                 StreamedAssistantContent::ToolCall(tool_call) => {
+                                    // Accumulate tool call for history
+                                    accumulated_tool_calls.push(tool_call.clone());
+
                                     // Send tool call notification
-                                    let tool_call_id =
-                                        ToolCallId::from(tool_call.id.clone());
+                                    let tool_call_id = ToolCallId::from(tool_call.id.clone());
                                     let kind = tool_name_to_kind(&tool_call.function.name);
                                     let title = format!("Calling {}", tool_call.function.name);
 
@@ -277,35 +341,37 @@ impl acp::Agent for CrowAcpAgent {
                             }
                         }
                         Ok(MultiTurnStreamItem::StreamUserItem(user_content)) => {
-                            // Tool results - send as tool call update
+                            // Tool results - accumulate AND send as tool call update
                             let rig::streaming::StreamedUserContent::ToolResult(result) =
                                 user_content;
-                            {
-                                let tool_call_id = ToolCallId::from(result.id.clone());
-                                let result_text = result
-                                    .content
-                                    .iter()
-                                    .filter_map(|c| {
-                                        if let rig::message::ToolResultContent::Text(t) = c {
-                                            Some(t.text.clone())
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n");
 
-                                self.send_update(SessionNotification::new(
-                                    args.session_id.clone(),
-                                    SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                        tool_call_id,
-                                        ToolCallUpdateFields::new()
-                                            .status(ToolCallStatus::Completed)
-                                            .content(vec![result_text.into()]),
-                                    )),
-                                ))
-                                .await?;
-                            }
+                            // Accumulate for history
+                            accumulated_tool_results.push(result.clone());
+
+                            let tool_call_id = ToolCallId::from(result.id.clone());
+                            let result_text = result
+                                .content
+                                .iter()
+                                .filter_map(|c| {
+                                    if let rig::message::ToolResultContent::Text(t) = c {
+                                        Some(t.text.clone())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
+
+                            self.send_update(SessionNotification::new(
+                                args.session_id.clone(),
+                                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                    tool_call_id,
+                                    ToolCallUpdateFields::new()
+                                        .status(ToolCallStatus::Completed)
+                                        .content(vec![result_text.into()]),
+                                )),
+                            ))
+                            .await?;
                         }
                         Ok(MultiTurnStreamItem::FinalResponse(final_resp)) => {
                             // Stream completed successfully - update history
@@ -315,10 +381,10 @@ impl acp::Agent for CrowAcpAgent {
                             let response_text = if !final_resp.response().is_empty() {
                                 final_resp.response().to_string()
                             } else {
-                                accumulated_response.clone()
+                                accumulated_text.clone()
                             };
 
-                            // Update session history with user message and assistant response
+                            // Update session history
                             let sessions = self.sessions.borrow();
                             if let Some(session) = sessions.get(&session_id) {
                                 let mut history = session.history.borrow_mut();
@@ -328,7 +394,7 @@ impl acp::Agent for CrowAcpAgent {
                                     content: OneOrMany::one(UserContent::text(&prompt_text)),
                                 });
 
-                                // Add assistant response
+                                // Add assistant response (final response is just text, tool calls already handled in multi-turn)
                                 history.push(Message::Assistant {
                                     id: None,
                                     content: OneOrMany::one(AssistantContent::Text(Text {
@@ -337,8 +403,6 @@ impl acp::Agent for CrowAcpAgent {
                                 });
 
                                 info!("History updated, now has {} messages", history.len());
-
-                                // Clear the active hook since operation completed
                                 *session.active_hook.borrow_mut() = None;
                             }
                         }
@@ -350,12 +414,20 @@ impl acp::Agent for CrowAcpAgent {
                             let is_cancelled = e.to_string().contains("PromptCancelled");
 
                             if is_cancelled {
-                                info!("Stream was cancelled");
-                                // Clear the active hook
-                                let sessions = self.sessions.borrow();
-                                if let Some(session) = sessions.get(&session_id) {
-                                    *session.active_hook.borrow_mut() = None;
+                                info!("Stream was cancelled via error");
+                                {
+                                    let sessions = self.sessions.borrow();
+                                    if let Some(session) = sessions.get(&session_id) {
+                                        *session.active_hook.borrow_mut() = None;
+                                    }
                                 }
+
+                                // Save everything we accumulated
+                                save_history(
+                                    &self.sessions, &session_id, &prompt_text,
+                                    &accumulated_text, &accumulated_tool_calls, &accumulated_tool_results
+                                );
+
                                 return Ok(PromptResponse::new(StopReason::Cancelled));
                             }
 
@@ -368,11 +440,19 @@ impl acp::Agent for CrowAcpAgent {
                             ))
                             .await?;
 
-                            // Clear the active hook on error
-                            let sessions = self.sessions.borrow();
-                            if let Some(session) = sessions.get(&session_id) {
-                                *session.active_hook.borrow_mut() = None;
+                            {
+                                let sessions = self.sessions.borrow();
+                                if let Some(session) = sessions.get(&session_id) {
+                                    *session.active_hook.borrow_mut() = None;
+                                }
                             }
+
+                            // Save everything we accumulated before error
+                            save_history(
+                                &self.sessions, &session_id, &prompt_text,
+                                &accumulated_text, &accumulated_tool_calls, &accumulated_tool_results
+                            );
+
                             return Ok(PromptResponse::new(StopReason::Refusal));
                         }
                     }
@@ -383,14 +463,12 @@ impl acp::Agent for CrowAcpAgent {
             Err(e) => {
                 error!("Prompt error: {}", e);
 
-                // Clear the active hook
                 let sessions = self.sessions.borrow();
                 if let Some(session) = sessions.get(&session_id) {
                     *session.active_hook.borrow_mut() = None;
                 }
                 drop(sessions);
 
-                // Send error as a message
                 self.send_update(SessionNotification::new(
                     args.session_id.clone(),
                     SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
@@ -399,7 +477,6 @@ impl acp::Agent for CrowAcpAgent {
                 ))
                 .await?;
 
-                // Return Refusal for errors
                 Ok(PromptResponse::new(StopReason::Refusal))
             }
         }
