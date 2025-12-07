@@ -1,0 +1,74 @@
+[package]
+name = "crow_agent"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+
+# LLM framework - using local fork with PromptHook exports
+rig-core = { path = "../rig/rig-core" }
+
+# Workflow (optional for now, will use later)
+# graph-flow = { path = "../rs-graph-llm/graph-flow" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# CLI
+clap = { version = "4.4", features = ["derive"] }
+rustyline = "14.0"
+
+# Logging / Telemetry
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+tracing-appender = "0.2"
+
+# OpenTelemetry
+opentelemetry = "0.30.0"
+opentelemetry_sdk = { version = "0.30.0", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.30.0", features = ["http-proto"] }
+tracing-opentelemetry = "0.31.0"
+
+# SQLite for telemetry storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Error handling
+anyhow = "1.0"
+thiserror = "2.0"
+
+# Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+walkdir = "2.5"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+grep-matcher = "0.1"
+ignore = "0.4"  # For .gitignore-aware file searching
+regex = "1.10"
+glob = "0.3"
+tempfile = { version = "3.10", optional = true }
+parking_lot = "0.12"
+schemars = "0.8"
+reqwest = { version = "0.12", features = ["json"] }
+handlebars = "6.0"
+
+# LSP client
+lsp-types = "0.97"
+smol = "2.0"
+which = "7.0"
+
+# ACP (Agent Client Protocol) for Zed integration
+agent-client-protocol = { version = "0.8", features = ["unstable"] }
+futures-io = "0.3"
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[dev-dependencies]
+tempfile = "3.10"
+
+[[bin]]
+name = "crow-agent"
+path = "src/main.rs"
