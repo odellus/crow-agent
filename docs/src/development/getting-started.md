@@ -118,7 +118,7 @@ crow_agent/
 │               └── openrouter/
 │                   ├── completion.rs
 │                   └── streaming.rs
-└── doc/                 # This documentation
+└── docs/                 # This documentation
     ├── book.toml
     └── src/
         └── ...

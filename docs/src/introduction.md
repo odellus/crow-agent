@@ -26,7 +26,7 @@ crow_agent/
 │   ├── config.rs        # Configuration
 │   └── tools/           # Tool implementations
 ├── rig/                 # Forked rig framework
-└── doc/                 # This documentation
+└── docs/                 # This documentation
 ```
 
 ## Quick Start
