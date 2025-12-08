@@ -120,6 +120,14 @@ enum Commands {
     Prompt {
         /// The prompt to send to the agent
         message: String,
+
+        /// Continue an existing session (provide session ID or prefix)
+        #[arg(short, long)]
+        session: Option<String>,
+
+        /// Start a new session (ignore any previous sessions)
+        #[arg(short, long)]
+        new: bool,
     },
 
     /// Run as an ACP server over stdio (for Zed integration)
@@ -249,8 +257,8 @@ async fn main() -> Result<()> {
             let agent = CrowAgent::new(config, telemetry.clone());
 
             match cli.command {
-                Some(Commands::Prompt { message }) => {
-                    run_single_prompt(&agent, &message).await?;
+                Some(Commands::Prompt { message, session, new }) => {
+                    run_single_prompt(&agent, &message, session.as_deref(), new).await?;
                 }
                 Some(Commands::Stats { sessions, tools }) => {
                     show_stats(&telemetry, sessions, tools)?;
@@ -368,12 +376,34 @@ fn run_query(telemetry: &Telemetry, sql: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_single_prompt(agent: &CrowAgent, message: &str) -> Result<()> {
+async fn run_single_prompt(
+    agent: &CrowAgent,
+    message: &str,
+    session_id: Option<&str>,
+    new_session: bool,
+) -> Result<()> {
     println!("Working directory: {}", agent.working_dir().display());
     println!("Database: {}", agent.telemetry().db_path().display());
+
+    // Load history from existing session if specified
+    let mut history: Vec<Message> = if !new_session {
+        if let Some(sid) = session_id {
+            println!("Continuing session: {}", sid);
+            load_session_history(agent.telemetry(), sid)?
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    if !history.is_empty() {
+        println!("Loaded {} messages from history", history.len());
+    }
+    println!("Session: {}", agent.telemetry().session_id());
     println!("---");
 
-    match agent.prompt(message).await {
+    match agent.chat(message, &mut history).await {
         Ok(response) => {
             println!("{}", response);
         }
@@ -388,6 +418,61 @@ async fn run_single_prompt(agent: &CrowAgent, message: &str) -> Result<()> {
     println!("{}", stats);
 
     Ok(())
+}
+
+/// Load chat history from a previous session
+fn load_session_history(telemetry: &Telemetry, session_prefix: &str) -> Result<Vec<Message>> {
+    use rusqlite::Connection;
+
+    let db_path = telemetry.db_path();
+    let conn = Connection::open(&db_path)?;
+
+    // Find the session ID (support prefix matching)
+    let session_id: String = conn.query_row(
+        "SELECT id FROM sessions WHERE id LIKE ?1 ORDER BY started_at DESC LIMIT 1",
+        [format!("{}%", session_prefix)],
+        |row| row.get(0),
+    )?;
+
+    // Load interactions in order
+    let mut stmt = conn.prepare(
+        "SELECT interaction_type, content, raw_request, raw_response
+         FROM interactions
+         WHERE session_id = ?1
+         ORDER BY timestamp ASC"
+    )?;
+
+    let mut messages = Vec::new();
+
+    let rows = stmt.query_map([&session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (interaction_type, content, _raw_request, _raw_response) = row?;
+
+        match interaction_type.as_str() {
+            "user_message" => {
+                if let Some(text) = content {
+                    messages.push(Message::user(text));
+                }
+            }
+            "assistant_message" => {
+                if let Some(text) = content {
+                    messages.push(Message::assistant(text));
+                }
+            }
+            // Skip tool_call interactions - they're part of the assistant turn
+            _ => {}
+        }
+    }
+
+    Ok(messages)
 }
 
 async fn run_repl(agent: &CrowAgent, data_dir: &PathBuf) -> Result<()> {

@@ -100,22 +100,8 @@ pub struct EditFileArgs {
     pub replace_all: bool,
 }
 
-/// Output from edit_file including a unified diff
-#[derive(Debug, Serialize)]
-pub struct EditFileOutput {
-    pub path: String,
-    pub mode: String,
-    pub message: String,
-    pub diff: String,
-    pub additions: usize,
-    pub deletions: usize,
-}
-
-impl std::fmt::Display for EditFileOutput {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}\n\n```diff\n{}\n```", self.message, self.diff)
-    }
-}
+// Re-export EditOutput as EditFileOutput for backwards compatibility
+pub use super::output::{EditMode as OutputEditMode, EditOutput as EditFileOutput};
 
 // ==================== Cascading Replacers ====================
 
@@ -650,136 +636,6 @@ fn replace(
     Err(EditFileError::MultipleMatches)
 }
 
-// ==================== Diff Generation ====================
-
-/// Normalizes line endings to LF
-fn normalize_line_endings(text: &str) -> String {
-    text.replace("\r\n", "\n")
-}
-
-/// Creates a unified diff using the similar crate
-fn create_unified_diff(old_path: &str, new_path: &str, old_content: &str, new_content: &str) -> String {
-    let diff = TextDiff::from_lines(old_content, new_content);
-    let mut output = String::new();
-
-    output.push_str(&format!("--- {}\n", old_path));
-    output.push_str(&format!("+++ {}\n", new_path));
-
-    for (_idx, group) in diff.grouped_ops(3).iter().enumerate() {
-        for op in group {
-            let tag = op.tag();
-            let old_range = op.old_range();
-            let new_range = op.new_range();
-
-            match tag {
-                similar::DiffTag::Delete => {
-                    output.push_str(&format!(
-                        "@@ -{},{} +{},{} @@\n",
-                        old_range.start + 1,
-                        old_range.len(),
-                        new_range.start + 1,
-                        new_range.len()
-                    ));
-                    for change in diff.iter_changes(op) {
-                        if change.tag() == ChangeTag::Delete {
-                            output.push_str(&format!("-{}", change));
-                        }
-                    }
-                }
-                similar::DiffTag::Insert => {
-                    output.push_str(&format!(
-                        "@@ -{},{} +{},{} @@\n",
-                        old_range.start + 1,
-                        old_range.len(),
-                        new_range.start + 1,
-                        new_range.len()
-                    ));
-                    for change in diff.iter_changes(op) {
-                        if change.tag() == ChangeTag::Insert {
-                            output.push_str(&format!("+{}", change));
-                        }
-                    }
-                }
-                similar::DiffTag::Equal => {
-                    // Skip equal sections in hunks
-                }
-                similar::DiffTag::Replace => {
-                    output.push_str(&format!(
-                        "@@ -{},{} +{},{} @@\n",
-                        old_range.start + 1,
-                        old_range.len(),
-                        new_range.start + 1,
-                        new_range.len()
-                    ));
-                    for change in diff.iter_changes(op) {
-                        match change.tag() {
-                            ChangeTag::Delete => output.push_str(&format!("-{}", change)),
-                            ChangeTag::Insert => output.push_str(&format!("+{}", change)),
-                            ChangeTag::Equal => output.push_str(&format!(" {}", change)),
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    output
-}
-
-/// Trims common whitespace from diff output for cleaner display
-fn trim_diff(diff: &str) -> String {
-    let lines: Vec<&str> = diff.lines().collect();
-    let content_lines: Vec<&str> = lines
-        .iter()
-        .filter(|line| {
-            (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
-                && !line.starts_with("---")
-                && !line.starts_with("+++")
-        })
-        .copied()
-        .collect();
-
-    if content_lines.is_empty() {
-        return diff.to_string();
-    }
-
-    let mut min_indent = usize::MAX;
-    for line in &content_lines {
-        let content = &line[1..];
-        if !content.trim().is_empty() {
-            if let Some(matched) = content.find(|c: char| !c.is_whitespace()) {
-                min_indent = min_indent.min(matched);
-            }
-        }
-    }
-
-    if min_indent == usize::MAX || min_indent == 0 {
-        return diff.to_string();
-    }
-
-    let trimmed_lines: Vec<String> = lines
-        .iter()
-        .map(|line| {
-            if (line.starts_with('+') || line.starts_with('-') || line.starts_with(' '))
-                && !line.starts_with("---")
-                && !line.starts_with("+++")
-            {
-                let prefix = line.chars().next().unwrap();
-                let content = &line[1..];
-                if content.len() >= min_indent {
-                    format!("{}{}", prefix, &content[min_indent..])
-                } else {
-                    line.to_string()
-                }
-            } else {
-                line.to_string()
-            }
-        })
-        .collect();
-
-    trimmed_lines.join("\n")
-}
-
 // ==================== Tool Implementation ====================
 
 /// Tool for editing files via search and replace
@@ -969,14 +825,13 @@ Usage notes:
 
                 Self::atomic_write(&path, &content)?;
 
-                let diff = trim_diff(&create_unified_diff("", &args.path, "", &content));
                 let line_count = content.lines().count();
 
                 Ok(EditFileOutput {
                     path: args.path,
-                    mode: "create".to_string(),
-                    message: format!("Created file ({} lines)", line_count),
-                    diff,
+                    mode: OutputEditMode::Create,
+                    old_content: None,
+                    new_content: content,
                     additions: line_count,
                     deletions: 0,
                 })
@@ -1008,13 +863,6 @@ Usage notes:
 
                 Self::atomic_write(&path, &new_content)?;
 
-                let diff = trim_diff(&create_unified_diff(
-                    &args.path,
-                    &args.path,
-                    &normalize_line_endings(&old_content),
-                    &normalize_line_endings(&new_content),
-                ));
-
                 // Calculate additions and deletions
                 let text_diff = TextDiff::from_lines(&old_content, &new_content);
                 let (mut additions, mut deletions) = (0, 0);
@@ -1028,9 +876,9 @@ Usage notes:
 
                 Ok(EditFileOutput {
                     path: args.path,
-                    mode: "overwrite".to_string(),
-                    message: "Replaced file contents".to_string(),
-                    diff,
+                    mode: OutputEditMode::Overwrite,
+                    old_content: Some(old_content),
+                    new_content,
                     additions,
                     deletions,
                 })
@@ -1066,13 +914,6 @@ Usage notes:
 
                 Self::atomic_write(&path, &new_content)?;
 
-                let diff = trim_diff(&create_unified_diff(
-                    &args.path,
-                    &args.path,
-                    &normalize_line_endings(&old_content),
-                    &normalize_line_endings(&new_content),
-                ));
-
                 // Calculate additions and deletions
                 let text_diff = TextDiff::from_lines(&old_content, &new_content);
                 let (mut additions, mut deletions) = (0, 0);
@@ -1086,12 +927,9 @@ Usage notes:
 
                 Ok(EditFileOutput {
                     path: args.path,
-                    mode: "edit".to_string(),
-                    message: format!(
-                        "Edited file (+{} -{} lines)",
-                        additions, deletions
-                    ),
-                    diff,
+                    mode: OutputEditMode::Edit,
+                    old_content: Some(old_content),
+                    new_content,
                     additions,
                     deletions,
                 })
@@ -1129,9 +967,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.mode, "create");
-        assert!(result.message.contains("Created"));
-        assert!(result.diff.contains("+Hello, World!"));
+        assert_eq!(result.mode, OutputEditMode::Create);
+        assert!(result.new_content.contains("Hello, World!"));
+        assert!(result.old_content.is_none());
 
         let content = std::fs::read_to_string(dir.path().join("new_file.txt")).unwrap();
         assert_eq!(content, "Hello, World!\nLine 2\n");
@@ -1179,9 +1017,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.mode, "overwrite");
-        assert!(result.diff.contains("-old content"));
-        assert!(result.diff.contains("+new content"));
+        assert_eq!(result.mode, OutputEditMode::Overwrite);
+        assert_eq!(result.old_content.as_deref(), Some("old content"));
+        assert_eq!(result.new_content, "new content");
 
         let content = std::fs::read_to_string(dir.path().join("file.txt")).unwrap();
         assert_eq!(content, "new content");
@@ -1211,9 +1049,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.mode, "edit");
-        assert!(result.diff.contains("-fn old_name()"));
-        assert!(result.diff.contains("+fn new_name()"));
+        assert_eq!(result.mode, OutputEditMode::Edit);
+        assert!(result.old_content.as_ref().unwrap().contains("fn old_name()"));
+        assert!(result.new_content.contains("fn new_name()"));
 
         let content = std::fs::read_to_string(dir.path().join("code.rs")).unwrap();
         assert!(content.contains("fn new_name()"));
@@ -1260,7 +1098,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.mode, "create");
+        assert_eq!(result.mode, OutputEditMode::Create);
 
         let content = std::fs::read_to_string(dir.path().join("a/b/c/deep.txt")).unwrap();
         assert_eq!(content, "deep file");
