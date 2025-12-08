@@ -42,6 +42,7 @@ pub mod auth;
 pub mod config;
 pub mod hooks;
 pub mod lsp;
+pub mod snapshot;
 pub mod telemetry;
 pub mod templates;
 pub mod tools;

@@ -67,6 +67,7 @@ agent-client-protocol = { version = "0.8", features = ["unstable"] }
 futures = "0.3"
 futures-io = "0.3"
 tokio-util = { version = "0.7", features = ["compat"] }
+dirs = "6.0.0"
 
 [dev-dependencies]
 tempfile = "3.10"

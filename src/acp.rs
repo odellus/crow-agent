@@ -29,8 +29,15 @@ use rig::streaming::StreamedAssistantContent;
 use rig::OneOrMany;
 use crate::config::Config;
 use crate::hooks::TelemetryHook;
+use crate::snapshot::{Patch, SnapshotManager};
 use crate::telemetry::Telemetry;
 use crate::CrowAgent;
+
+/// Outgoing notifications from agent to client
+pub enum OutgoingNotification {
+    Session(SessionNotification),
+    Extension(ExtNotification),
+}
 
 /// Session state for an active ACP session
 struct Session {
@@ -40,12 +47,18 @@ struct Session {
     active_hook: RefCell<Option<TelemetryHook>>,
     /// Flag to indicate the session should be cancelled
     cancelled: Cell<bool>,
+    /// Snapshot manager for tracking file changes
+    snapshot_manager: SnapshotManager,
+    /// Current snapshot hash (taken before each prompt)
+    current_snapshot: RefCell<Option<String>>,
+    /// Accumulated patches from file-modifying tools (for undo)
+    patches: RefCell<Vec<Patch>>,
 }
 
 /// Crow's ACP Agent implementation
 pub struct CrowAcpAgent {
-    /// Channel for sending session notifications back to the client
-    session_update_tx: mpsc::UnboundedSender<(SessionNotification, oneshot::Sender<()>)>,
+    /// Channel for sending notifications back to the client
+    notification_tx: mpsc::UnboundedSender<(OutgoingNotification, oneshot::Sender<()>)>,
     /// Counter for generating session IDs
     next_session_id: Cell<u64>,
     /// Active sessions
@@ -59,12 +72,12 @@ pub struct CrowAcpAgent {
 impl CrowAcpAgent {
     /// Create a new CrowAcpAgent
     pub fn new(
-        session_update_tx: mpsc::UnboundedSender<(SessionNotification, oneshot::Sender<()>)>,
+        notification_tx: mpsc::UnboundedSender<(OutgoingNotification, oneshot::Sender<()>)>,
         config: Config,
         telemetry: Arc<Telemetry>,
     ) -> Self {
         Self {
-            session_update_tx,
+            notification_tx,
             next_session_id: Cell::new(0),
             sessions: RefCell::new(HashMap::new()),
             config,
@@ -75,8 +88,18 @@ impl CrowAcpAgent {
     /// Send a session update notification and wait for acknowledgment
     async fn send_update(&self, notification: SessionNotification) -> acp::Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.session_update_tx
-            .send((notification, tx))
+        self.notification_tx
+            .send((OutgoingNotification::Session(notification), tx))
+            .map_err(|_| acp::Error::internal_error())?;
+        rx.await.map_err(|_| acp::Error::internal_error())?;
+        Ok(())
+    }
+
+    /// Send an extension notification and wait for acknowledgment
+    async fn send_ext_notification(&self, notification: ExtNotification) -> acp::Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.notification_tx
+            .send((OutgoingNotification::Extension(notification), tx))
             .map_err(|_| acp::Error::internal_error())?;
         rx.await.map_err(|_| acp::Error::internal_error())?;
         Ok(())
@@ -125,7 +148,10 @@ impl acp::Agent for CrowAcpAgent {
         };
 
         // Create a new agent for this session
-        let agent = CrowAgent::new(session_config, self.telemetry.clone());
+        let agent = CrowAgent::new(session_config.clone(), self.telemetry.clone());
+
+        // Create snapshot manager for this session's working directory
+        let snapshot_manager = SnapshotManager::for_directory(session_config.working_dir.clone());
 
         // Store the session
         self.sessions.borrow_mut().insert(
@@ -135,6 +161,9 @@ impl acp::Agent for CrowAcpAgent {
                 history: RefCell::new(Vec::new()),
                 active_hook: RefCell::new(None),
                 cancelled: Cell::new(false),
+                snapshot_manager,
+                current_snapshot: RefCell::new(None),
+                patches: RefCell::new(Vec::new()),
             },
         );
 
@@ -164,6 +193,28 @@ impl acp::Agent for CrowAcpAgent {
         if prompt_text.is_empty() {
             return Err(acp::Error::invalid_params());
         }
+
+        // Take a snapshot before processing (for undo support)
+        let snapshot_hash = {
+            let sessions = self.sessions.borrow();
+            if let Some(session) = sessions.get(&session_id) {
+                match session.snapshot_manager.track().await {
+                    Ok(hash) => {
+                        if let Some(ref h) = hash {
+                            info!("Snapshot tracked: {}", &h[..12.min(h.len())]);
+                        }
+                        *session.current_snapshot.borrow_mut() = hash.clone();
+                        hash
+                    }
+                    Err(e) => {
+                        debug!("Failed to track snapshot: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        };
 
         // Get the session and start streaming
         let stream_result = {
@@ -345,6 +396,12 @@ impl acp::Agent for CrowAcpAgent {
                             let rig::streaming::StreamedUserContent::ToolResult(result) =
                                 user_content;
 
+                            // Find the tool call that corresponds to this result
+                            let tool_name = accumulated_tool_calls
+                                .iter()
+                                .find(|tc| tc.id == result.id)
+                                .map(|tc| tc.function.name.clone());
+
                             // Accumulate for history
                             accumulated_tool_results.push(result.clone());
 
@@ -372,6 +429,65 @@ impl acp::Agent for CrowAcpAgent {
                                 )),
                             ))
                             .await?;
+
+                            // Check if this was a file-modifying tool and track changes
+                            if let Some(ref name) = tool_name {
+                                let is_file_modifying = matches!(
+                                    name.as_str(),
+                                    "edit_file" | "write" | "terminal" | "bash"
+                                );
+
+                                if is_file_modifying {
+                                    if let Some(ref hash) = snapshot_hash {
+                                        // Get patch info and store it
+                                        let patch_info = {
+                                            let sessions = self.sessions.borrow();
+                                            if let Some(session) = sessions.get(&session_id) {
+                                                if let Ok(patch) = session.snapshot_manager.patch(hash).await {
+                                                    if !patch.files.is_empty() {
+                                                        info!(
+                                                            "Tool {} modified {} files",
+                                                            name,
+                                                            patch.files.len()
+                                                        );
+                                                        let patch_index = session.patches.borrow().len();
+                                                        let files: Vec<String> = patch.files.iter()
+                                                            .map(|f| f.display().to_string())
+                                                            .collect();
+                                                        // Store patch for potential undo
+                                                        session.patches.borrow_mut().push(patch);
+                                                        Some((patch_index, files))
+                                                    } else {
+                                                        None
+                                                    }
+                                                } else {
+                                                    None
+                                                }
+                                            } else {
+                                                None
+                                            }
+                                        };
+
+                                        // Send extension notification about the patch (outside the borrow)
+                                        if let Some((patch_index, files)) = patch_info {
+                                            let patch_data = serde_json::json!({
+                                                "session_id": session_id,
+                                                "patch_index": patch_index,
+                                                "files": files,
+                                                "tool": name
+                                            });
+                                            if let Ok(raw) = serde_json::value::to_raw_value(&patch_data) {
+                                                let ext_notif = ExtNotification::new(
+                                                    "session/patch",
+                                                    raw.into()
+                                                );
+                                                // Fire and forget - don't block on this
+                                                let _ = self.send_ext_notification(ext_notif).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Ok(MultiTurnStreamItem::FinalResponse(final_resp)) => {
                             // Stream completed successfully - update history
@@ -517,12 +633,140 @@ impl acp::Agent for CrowAcpAgent {
 
     async fn ext_method(&self, args: ExtRequest) -> acp::Result<ExtResponse> {
         info!("ACP ext_method: {}", args.method);
-        // No extension methods supported
-        Ok(ExtResponse::new(
-            serde_json::value::RawValue::from_string("null".to_string())
-                .unwrap()
-                .into(),
-        ))
+
+        match &*args.method {
+            "session/revert" => {
+                // Revert to a previous snapshot
+                // Expected params: { "session_id": "...", "patch_index": N } or { "session_id": "...", "all": true }
+                let params = serde_json::from_str::<serde_json::Value>(args.params.get())
+                    .unwrap_or(serde_json::Value::Null);
+
+                let session_id = params.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(acp::Error::invalid_params)?;
+
+                let sessions = self.sessions.borrow();
+                let session = sessions.get(session_id)
+                    .ok_or_else(acp::Error::invalid_params)?;
+
+                let patches = session.patches.borrow();
+
+                if patches.is_empty() {
+                    info!("No patches to revert for session {}", session_id);
+                    return Ok(ExtResponse::new(
+                        serde_json::value::RawValue::from_string(
+                            r#"{"reverted": false, "reason": "no patches available"}"#.to_string()
+                        ).unwrap().into(),
+                    ));
+                }
+
+                // Check if we're reverting all or just the last one
+                let revert_all = params.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                let patch_index = params.get("patch_index").and_then(|v| v.as_u64());
+
+                let patches_to_revert: Vec<Patch> = if revert_all {
+                    patches.clone()
+                } else if let Some(idx) = patch_index {
+                    if (idx as usize) < patches.len() {
+                        vec![patches[idx as usize].clone()]
+                    } else {
+                        return Ok(ExtResponse::new(
+                            serde_json::value::RawValue::from_string(
+                                r#"{"reverted": false, "reason": "invalid patch index"}"#.to_string()
+                            ).unwrap().into(),
+                        ));
+                    }
+                } else {
+                    // Default: revert the last patch
+                    vec![patches.last().unwrap().clone()]
+                };
+
+                drop(patches);
+
+                // Perform the revert
+                match session.snapshot_manager.revert(&patches_to_revert).await {
+                    Ok(()) => {
+                        let reverted_count = patches_to_revert.len();
+                        let files_reverted: Vec<String> = patches_to_revert
+                            .iter()
+                            .flat_map(|p| p.files.iter().map(|f| f.display().to_string()))
+                            .collect();
+
+                        info!("Reverted {} patches ({} files) for session {}",
+                              reverted_count, files_reverted.len(), session_id);
+
+                        // Remove reverted patches from the list
+                        let mut patches = session.patches.borrow_mut();
+                        if revert_all {
+                            patches.clear();
+                        } else if let Some(idx) = patch_index {
+                            patches.remove(idx as usize);
+                        } else {
+                            patches.pop();
+                        }
+
+                        Ok(ExtResponse::new(
+                            serde_json::value::RawValue::from_string(
+                                serde_json::json!({
+                                    "reverted": true,
+                                    "patches_reverted": reverted_count,
+                                    "files": files_reverted
+                                }).to_string()
+                            ).unwrap().into(),
+                        ))
+                    }
+                    Err(e) => {
+                        error!("Failed to revert: {}", e);
+                        Ok(ExtResponse::new(
+                            serde_json::value::RawValue::from_string(
+                                serde_json::json!({
+                                    "reverted": false,
+                                    "reason": e
+                                }).to_string()
+                            ).unwrap().into(),
+                        ))
+                    }
+                }
+            }
+
+            "session/patches" => {
+                // List available patches for a session
+                let params = serde_json::from_str::<serde_json::Value>(args.params.get())
+                    .unwrap_or(serde_json::Value::Null);
+
+                let session_id = params.get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(acp::Error::invalid_params)?;
+
+                let sessions = self.sessions.borrow();
+                let session = sessions.get(session_id)
+                    .ok_or_else(acp::Error::invalid_params)?;
+
+                let patches = session.patches.borrow();
+                let patch_list: Vec<serde_json::Value> = patches.iter().enumerate().map(|(i, p)| {
+                    serde_json::json!({
+                        "index": i,
+                        "hash": &p.hash[..12.min(p.hash.len())],
+                        "files": p.files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>()
+                    })
+                }).collect();
+
+                Ok(ExtResponse::new(
+                    serde_json::value::RawValue::from_string(
+                        serde_json::json!({ "patches": patch_list }).to_string()
+                    ).unwrap().into(),
+                ))
+            }
+
+            _ => {
+                // Unknown extension method
+                Ok(ExtResponse::new(
+                    serde_json::value::RawValue::from_string("null".to_string())
+                        .unwrap()
+                        .into(),
+                ))
+            }
+        }
     }
 
     async fn ext_notification(&self, args: ExtNotification) -> acp::Result<()> {
@@ -593,11 +837,19 @@ pub async fn run_stdio_server(config: Config, telemetry: Arc<Telemetry>) -> acp:
             tokio::task::spawn_local(fut);
         });
 
-    // Background task to send session notifications
+    // Background task to send notifications
     tokio::task::spawn_local(async move {
         while let Some((notification, tx)) = rx.recv().await {
-            if let Err(e) = conn.session_notification(notification).await {
-                error!("Failed to send session notification: {}", e);
+            let result = match notification {
+                OutgoingNotification::Session(session_notif) => {
+                    conn.session_notification(session_notif).await
+                }
+                OutgoingNotification::Extension(ext_notif) => {
+                    conn.ext_notification(ext_notif).await
+                }
+            };
+            if let Err(e) = result {
+                error!("Failed to send notification: {}", e);
                 break;
             }
             tx.send(()).ok();
