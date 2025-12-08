@@ -14,7 +14,7 @@ use rig::providers::openrouter;
 use rig::streaming::StreamingPrompt;
 
 /// Maximum number of tool-call rounds before stopping
-const MAX_TOOL_TURNS: usize = 20;
+const MAX_TOOL_TURNS: usize = 20000000;
 use std::path::PathBuf;
 use std::sync::Arc;
 
