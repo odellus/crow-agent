@@ -44,7 +44,11 @@ impl CrowAgent {
     }
 
     /// Create a new CrowAgent with a shared TodoStore (for multi-agent scenarios)
-    pub fn with_todo_store(config: Config, telemetry: Arc<Telemetry>, todo_store: TodoStore) -> Self {
+    pub fn with_todo_store(
+        config: Config,
+        telemetry: Arc<Telemetry>,
+        todo_store: TodoStore,
+    ) -> Self {
         let working_dir = config.working_dir.clone();
         let session_id = telemetry.session_id().to_string();
         Self {
@@ -82,7 +86,8 @@ impl CrowAgent {
         let project = ProjectContext {
             worktrees: vec![WorktreeContext {
                 abs_path: self.working_dir.display().to_string(),
-                root_name: self.working_dir
+                root_name: self
+                    .working_dir
                     .file_name()
                     .map(|s| s.to_string_lossy().to_string())
                     .unwrap_or_else(|| "root".to_string()),
@@ -130,8 +135,14 @@ impl CrowAgent {
                     .tool(Terminal::new(wd.clone()))
                     .tool(Thinking)
                     .tool(Now)
-                    .tool(TodoWrite::new(self.todo_store.clone(), self.session_id.clone()))
-                    .tool(TodoRead::new(self.todo_store.clone(), self.session_id.clone()))
+                    .tool(TodoWrite::new(
+                        self.todo_store.clone(),
+                        self.session_id.clone(),
+                    ))
+                    .tool(TodoRead::new(
+                        self.todo_store.clone(),
+                        self.session_id.clone(),
+                    ))
                     .tool(Fetch::new())
                     .tool(WebSearch::new())
                     .tool(Diagnostics::new(wd.clone()))
@@ -145,10 +156,18 @@ impl CrowAgent {
             }
             LlmProvider::Custom => {
                 // For LM Studio or other OpenAI-compatible endpoints
-                let base_url = self.config.llm.base_url.as_ref()
+                let base_url = self
+                    .config
+                    .llm
+                    .base_url
+                    .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("base_url required for custom provider"))?;
 
-                let api_key = self.config.llm.api_key.as_ref()
+                let api_key = self
+                    .config
+                    .llm
+                    .api_key
+                    .as_ref()
                     .map(|s| s.as_str())
                     .unwrap_or("no-key");
 
@@ -168,8 +187,14 @@ impl CrowAgent {
                     .tool(Terminal::new(wd.clone()))
                     .tool(Thinking)
                     .tool(Now)
-                    .tool(TodoWrite::new(self.todo_store.clone(), self.session_id.clone()))
-                    .tool(TodoRead::new(self.todo_store.clone(), self.session_id.clone()))
+                    .tool(TodoWrite::new(
+                        self.todo_store.clone(),
+                        self.session_id.clone(),
+                    ))
+                    .tool(TodoRead::new(
+                        self.todo_store.clone(),
+                        self.session_id.clone(),
+                    ))
                     .tool(Fetch::new())
                     .tool(WebSearch::new())
                     .tool(Diagnostics::new(wd.clone()))
@@ -184,31 +209,12 @@ impl CrowAgent {
             _ => {
                 // For now, default to OpenRouter for other providers
                 // TODO: Add proper support for OpenAI, Anthropic
-                anyhow::bail!("Provider {:?} not yet implemented, use OpenRouter or Custom",
-                    self.config.llm.provider)
+                anyhow::bail!(
+                    "Provider {:?} not yet implemented, use OpenRouter or Custom",
+                    self.config.llm.provider
+                )
             }
         }
-    }
-
-    /// Run a single prompt and get response
-    pub async fn prompt(&self, message: &str) -> Result<String> {
-        self.telemetry.log_user_message(message).await;
-
-        let start = std::time::Instant::now();
-        let agent = self.build_agent()?;
-        let hook = TelemetryHook::new(self.telemetry.clone());
-
-        let response = agent
-            .prompt(message)
-            .with_hook(hook)
-            .multi_turn(MAX_TOOL_TURNS)
-            .await
-            .map_err(|e| anyhow::anyhow!("Chat error: {}", e))?;
-
-        let duration = start.elapsed().as_millis() as u64;
-        self.telemetry.log_response(&response, None, duration, Some(&self.config.llm.model), None).await;
-
-        Ok(response)
     }
 
     /// Run a multi-turn chat session
@@ -230,7 +236,15 @@ impl CrowAgent {
         // History is updated by with_history
 
         let duration = start.elapsed().as_millis() as u64;
-        self.telemetry.log_response(&response, None, duration, Some(&self.config.llm.model), None).await;
+        self.telemetry
+            .log_response(
+                &response,
+                None,
+                duration,
+                Some(&self.config.llm.model),
+                None,
+            )
+            .await;
 
         Ok(response)
     }
@@ -251,7 +265,10 @@ impl CrowAgent {
         &self,
         message: &str,
         history: Vec<Message>,
-    ) -> Result<(StreamingPromptRequest<openrouter::CompletionModel, TelemetryHook>, TelemetryHook)> {
+    ) -> Result<(
+        StreamingPromptRequest<openrouter::CompletionModel, TelemetryHook>,
+        TelemetryHook,
+    )> {
         self.telemetry.log_user_message(message).await;
 
         let agent = self.build_agent()?;
