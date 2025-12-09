@@ -37,7 +37,6 @@
 //! ```
 
 pub mod acp;
-pub mod agent;
 pub mod auth;
 pub mod config;
 pub mod hooks;
@@ -48,8 +47,27 @@ pub mod templates;
 pub mod tools;
 pub mod trace_layer;
 
+// New architecture (replacing rig-based agent)
+pub mod events;
+pub mod provider;
+pub mod tool;
+pub mod tools2;
+
+// Old rig-based agent (to be migrated)
+#[path = "agent.rs"]
+pub mod agent_old;
+
+// New agent system
+#[path = "agent/mod.rs"]
+pub mod agent;
+
 pub use acp::run_stdio_server;
-pub use agent::CrowAgent;
+pub use agent_old::CrowAgent; // Keep old export for now
 pub use auth::AuthConfig;
 pub use config::Config;
-pub use telemetry::Telemetry;
+pub use telemetry::{Telemetry, TraceGuard};
+
+// New exports
+pub use agent::{ACPAgent, AgentConfig, BaseAgent, ControlFlow};
+pub use events::{AgentEvent, AgentEventStream, TurnResult};
+pub use provider::{ProviderClient, ProviderConfig, StreamDelta};

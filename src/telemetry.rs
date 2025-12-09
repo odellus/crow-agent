@@ -257,6 +257,330 @@ impl TelemetryDb {
         )?;
         Ok(())
     }
+
+    fn insert_trace(&self, trace: &TraceRecord) -> anyhow::Result<()> {
+        // First ensure we have the agent_name column (migration)
+        let _ = self.conn.execute(
+            "ALTER TABLE traces ADD COLUMN agent_name TEXT DEFAULT 'unknown'",
+            [],
+        );
+
+        // Use INSERT OR REPLACE so flush() can be called multiple times
+        self.conn.execute(
+            r#"INSERT OR REPLACE INTO traces
+               (id, session_id, agent_name, started_at, completed_at, model_provider, model_id,
+                request_messages, request_tools, response_content, response_tool_calls,
+                input_tokens, output_tokens, total_tokens, latency_ms, error)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"#,
+            params![
+                trace.id.to_string(),
+                trace.session_id.to_string(),
+                trace.agent_name,
+                trace.started_at.to_rfc3339(),
+                trace.completed_at.map(|t| t.to_rfc3339()),
+                trace.model_provider,
+                trace.model_id,
+                trace.request_messages,
+                trace.request_tools,
+                trace.response_content,
+                trace.response_tool_calls,
+                trace.input_tokens.map(|t| t as i64),
+                trace.output_tokens.map(|t| t as i64),
+                trace.total_tokens.map(|t| t as i64),
+                trace.latency_ms.map(|t| t as i64),
+                trace.error
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+/// A full LLM call trace record
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TraceRecord {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub agent_name: String,
+    pub started_at: DateTime<Utc>,
+    pub completed_at: Option<DateTime<Utc>>,
+    pub model_provider: String,
+    pub model_id: String,
+    pub request_messages: String,
+    pub request_tools: Option<String>,
+    pub response_content: Option<String>,
+    pub response_tool_calls: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub latency_ms: Option<u64>,
+    pub error: Option<String>,
+}
+
+/// Builder for creating traces - start before LLM call, complete after
+#[derive(Debug, Clone)]
+pub struct TraceBuilder {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub agent_name: String,
+    pub model_provider: String,
+    pub model_id: String,
+    pub request_messages: String,
+    pub request_tools: Option<String>,
+    pub started_at: DateTime<Utc>,
+}
+
+/// Guard that saves trace on drop - ensures partial data is saved even on interruption
+///
+/// NOTE: For SIGTERM/SIGKILL protection, call `flush()` periodically during streaming.
+/// Drop only runs on graceful shutdown - hard kills won't trigger it.
+pub struct TraceGuard {
+    telemetry: Arc<Telemetry>,
+    id: Uuid,
+    session_id: Uuid,
+    agent_name: String,
+    model_provider: String,
+    model_id: String,
+    request_messages: String,
+    request_tools: Option<String>,
+    started_at: DateTime<Utc>,
+    // Accumulated response data - updated as streaming progresses
+    pub response_content: String,
+    pub response_thinking: String,
+    pub response_tool_calls: Vec<serde_json::Value>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub error: Option<String>,
+    // Set to true when explicitly completed (prevents double-save)
+    completed: bool,
+    // Track if we've saved to DB yet (for upsert logic)
+    saved_once: bool,
+}
+
+impl TraceGuard {
+    pub fn new(telemetry: Arc<Telemetry>, builder: TraceBuilder) -> Self {
+        Self {
+            telemetry,
+            id: builder.id,
+            session_id: builder.session_id,
+            agent_name: builder.agent_name,
+            model_provider: builder.model_provider,
+            model_id: builder.model_id,
+            request_messages: builder.request_messages,
+            request_tools: builder.request_tools,
+            started_at: builder.started_at,
+            response_content: String::new(),
+            response_thinking: String::new(),
+            response_tool_calls: Vec::new(),
+            input_tokens: None,
+            output_tokens: None,
+            error: None,
+            completed: false,
+            saved_once: false,
+        }
+    }
+
+    /// Append text to the response
+    pub fn push_text(&mut self, text: &str) {
+        self.response_content.push_str(text);
+    }
+
+    /// Append thinking/reasoning tokens
+    pub fn push_thinking(&mut self, text: &str) {
+        self.response_thinking.push_str(text);
+    }
+
+    /// Add a tool call
+    pub fn push_tool_call(&mut self, id: &str, name: &str, arguments: &str) {
+        self.response_tool_calls.push(serde_json::json!({
+            "id": id,
+            "name": name,
+            "arguments": arguments
+        }));
+    }
+
+    /// Update token counts
+    pub fn set_usage(&mut self, input: u64, output: u64) {
+        self.input_tokens = Some(input);
+        self.output_tokens = Some(output);
+    }
+
+    /// Mark as errored
+    pub fn set_error(&mut self, error: impl Into<String>) {
+        self.error = Some(error.into());
+    }
+
+    /// Flush current state to database - call periodically during streaming
+    /// for SIGTERM protection. Safe to call multiple times.
+    pub fn flush(&mut self) {
+        self.save_impl();
+        self.saved_once = true;
+    }
+
+    /// Explicitly complete and save (prevents drop from saving again)
+    pub fn complete(mut self) {
+        self.save_impl();
+        self.completed = true;
+    }
+
+    fn save_impl(&self) {
+        let completed_at = Utc::now();
+        let latency_ms = (completed_at - self.started_at).num_milliseconds() as u64;
+
+        let tool_calls_json = if self.response_tool_calls.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&self.response_tool_calls).ok()
+        };
+
+        let trace = TraceRecord {
+            id: self.id,
+            session_id: self.session_id,
+            agent_name: self.agent_name.clone(),
+            started_at: self.started_at,
+            completed_at: Some(completed_at),
+            model_provider: self.model_provider.clone(),
+            model_id: self.model_id.clone(),
+            request_messages: self.request_messages.clone(),
+            request_tools: self.request_tools.clone(),
+            response_content: {
+                // Combine thinking + content for full trace
+                let mut full_content = String::new();
+                if !self.response_thinking.is_empty() {
+                    full_content.push_str("<thinking>\n");
+                    full_content.push_str(&self.response_thinking);
+                    full_content.push_str("\n</thinking>\n");
+                }
+                if !self.response_content.is_empty() {
+                    full_content.push_str(&self.response_content);
+                }
+                if full_content.is_empty() {
+                    None
+                } else {
+                    Some(full_content)
+                }
+            },
+            response_tool_calls: tool_calls_json,
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            total_tokens: match (self.input_tokens, self.output_tokens) {
+                (Some(i), Some(o)) => Some(i + o),
+                _ => None,
+            },
+            latency_ms: Some(latency_ms),
+            error: self.error.clone(),
+        };
+
+        self.telemetry.save_trace(trace);
+    }
+}
+
+impl Drop for TraceGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            // Save whatever we accumulated before being dropped
+            self.save_impl();
+        }
+    }
+}
+
+impl TraceBuilder {
+    pub fn new(
+        session_id: Uuid,
+        agent_name: impl Into<String>,
+        model_provider: impl Into<String>,
+        model_id: impl Into<String>,
+        request_messages: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            session_id,
+            agent_name: agent_name.into(),
+            model_provider: model_provider.into(),
+            model_id: model_id.into(),
+            request_messages: request_messages.into(),
+            request_tools: None,
+            started_at: Utc::now(),
+        }
+    }
+
+    pub fn with_tools(mut self, tools: impl Into<String>) -> Self {
+        self.request_tools = Some(tools.into());
+        self
+    }
+
+    /// Complete the trace with success
+    pub fn complete(
+        self,
+        response_content: Option<String>,
+        response_tool_calls: Option<String>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> TraceRecord {
+        let completed_at = Utc::now();
+        let latency_ms = (completed_at - self.started_at).num_milliseconds() as u64;
+
+        TraceRecord {
+            id: self.id,
+            session_id: self.session_id,
+            agent_name: self.agent_name,
+            started_at: self.started_at,
+            completed_at: Some(completed_at),
+            model_provider: self.model_provider,
+            model_id: self.model_id,
+            request_messages: self.request_messages,
+            request_tools: self.request_tools,
+            response_content,
+            response_tool_calls,
+            input_tokens,
+            output_tokens,
+            total_tokens: match (input_tokens, output_tokens) {
+                (Some(i), Some(o)) => Some(i + o),
+                _ => None,
+            },
+            latency_ms: Some(latency_ms),
+            error: None,
+        }
+    }
+
+    /// Complete the trace with an error (discards partial data)
+    pub fn fail(self, error: impl Into<String>) -> TraceRecord {
+        self.fail_with_partial(error, None, None, None, None)
+    }
+
+    /// Complete the trace with an error, preserving any partial data we accumulated
+    pub fn fail_with_partial(
+        self,
+        error: impl Into<String>,
+        response_content: Option<String>,
+        response_tool_calls: Option<String>,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> TraceRecord {
+        let completed_at = Utc::now();
+        let latency_ms = (completed_at - self.started_at).num_milliseconds() as u64;
+
+        TraceRecord {
+            id: self.id,
+            session_id: self.session_id,
+            agent_name: self.agent_name,
+            started_at: self.started_at,
+            completed_at: Some(completed_at),
+            model_provider: self.model_provider,
+            model_id: self.model_id,
+            request_messages: self.request_messages,
+            request_tools: self.request_tools,
+            response_content,
+            response_tool_calls,
+            input_tokens,
+            output_tokens,
+            total_tokens: match (input_tokens, output_tokens) {
+                (Some(i), Some(o)) => Some(i + o),
+                _ => None,
+            },
+            latency_ms: Some(latency_ms),
+            error: Some(error.into()),
+        }
+    }
 }
 
 /// Main telemetry handler
@@ -371,11 +695,19 @@ impl Telemetry {
                 .with(sqlite_layer);
             subscriber.try_init().ok();
             None
-        } else {
-            // Normal mode: console + file + SQLite
+        } else if verbose {
+            // Verbose mode: console + file + SQLite
             let subscriber = tracing_subscriber::registry()
                 .with(make_env_filter())
                 .with(fmt::layer().with_target(false).compact())
+                .with(fmt::layer().json().with_writer(non_blocking))
+                .with(sqlite_layer);
+            subscriber.try_init().ok();
+            None
+        } else {
+            // Normal mode: file + SQLite only (no console noise)
+            let subscriber = tracing_subscriber::registry()
+                .with(make_env_filter())
                 .with(fmt::layer().json().with_writer(non_blocking))
                 .with(sqlite_layer);
             subscriber.try_init().ok();
@@ -584,6 +916,49 @@ impl Telemetry {
 
         if let Ok(db) = self.db.lock() {
             let _ = db.insert_interaction(&record);
+        }
+    }
+
+    /// Start a trace - call before making an LLM request
+    /// Returns a TraceBuilder that should be completed after the request
+    pub fn start_trace(
+        &self,
+        agent_name: impl Into<String>,
+        model_provider: impl Into<String>,
+        model_id: impl Into<String>,
+        request_messages: impl Into<String>,
+    ) -> TraceBuilder {
+        TraceBuilder::new(
+            self.session.id,
+            agent_name,
+            model_provider,
+            model_id,
+            request_messages,
+        )
+    }
+
+    /// Save a completed trace to the database
+    pub fn save_trace(&self, trace: TraceRecord) {
+        tracing::debug!(
+            trace_id = %trace.id,
+            agent = %trace.agent_name,
+            model = %trace.model_id,
+            input_tokens = ?trace.input_tokens,
+            output_tokens = ?trace.output_tokens,
+            latency_ms = ?trace.latency_ms,
+            error = ?trace.error,
+            "LLM trace"
+        );
+
+        match self.db.lock() {
+            Ok(db) => {
+                if let Err(e) = db.insert_trace(&trace) {
+                    tracing::error!(error = %e, trace_id = %trace.id, "Failed to insert trace");
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to lock telemetry db");
+            }
         }
     }
 

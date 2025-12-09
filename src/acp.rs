@@ -15,23 +15,27 @@ use agent_client_protocol::{
     TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
     ToolKind,
 };
-use futures::StreamExt;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-use rig::agent::MultiTurnStreamItem;
-use rig::message::{AssistantContent, Message, Text, UserContent};
-use rig::streaming::StreamedAssistantContent;
-use rig::OneOrMany;
+use async_openai::types::{
+    ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs,
+    ChatCompletionRequestUserMessageArgs, ChatCompletionRequestAssistantMessageArgs,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionTool,
+};
+
+use crate::agent::{AgentConfig, BaseAgent};
 use crate::config::Config;
-use crate::hooks::TelemetryHook;
+use crate::events::{AgentEvent, TurnCompleteReason};
+use crate::provider::{ProviderClient, ProviderConfig};
 use crate::snapshot::{Patch, SnapshotManager};
 use crate::telemetry::Telemetry;
-use crate::CrowAgent;
+use crate::tool::ToolRegistry;
+use crate::tools2;
 
 /// Outgoing notifications from agent to client
 pub enum OutgoingNotification {
@@ -41,12 +45,16 @@ pub enum OutgoingNotification {
 
 /// Session state for an active ACP session
 struct Session {
-    agent: CrowAgent,
-    history: RefCell<Vec<rig::message::Message>>,
-    /// Active hook for the current operation - used for cancellation
-    active_hook: RefCell<Option<TelemetryHook>>,
-    /// Flag to indicate the session should be cancelled
-    cancelled: Cell<bool>,
+    /// The base agent for this session
+    agent: BaseAgent,
+    /// Tool registry
+    registry: ToolRegistry,
+    /// OpenAI-format tools for LLM
+    tools: Vec<ChatCompletionTool>,
+    /// Conversation history
+    history: RefCell<Vec<ChatCompletionRequestMessage>>,
+    /// Cancellation token for current operation
+    cancellation: RefCell<Option<CancellationToken>>,
     /// Snapshot manager for tracking file changes
     snapshot_manager: SnapshotManager,
     /// Current snapshot hash (taken before each prompt)
@@ -67,6 +75,8 @@ pub struct CrowAcpAgent {
     config: Config,
     /// Shared telemetry instance
     telemetry: Arc<Telemetry>,
+    /// Provider for LLM calls
+    provider: Arc<ProviderClient>,
 }
 
 impl CrowAcpAgent {
@@ -75,14 +85,25 @@ impl CrowAcpAgent {
         notification_tx: mpsc::UnboundedSender<(OutgoingNotification, oneshot::Sender<()>)>,
         config: Config,
         telemetry: Arc<Telemetry>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, String> {
+        // Build provider from config
+        let base_url = config.llm.base_url.as_deref().unwrap_or("http://localhost:1234/v1");
+        let provider_config = ProviderConfig::custom(
+            config.llm.provider.as_str(),
+            base_url,
+            "UNUSED", // API key env var - not used for local
+            &config.llm.model,
+        );
+        let provider = Arc::new(ProviderClient::new(provider_config)?);
+
+        Ok(Self {
             notification_tx,
             next_session_id: Cell::new(0),
             sessions: RefCell::new(HashMap::new()),
             config,
             telemetry,
-        }
+            provider,
+        })
     }
 
     /// Send a session update notification and wait for acknowledgment
@@ -103,6 +124,16 @@ impl CrowAcpAgent {
             .map_err(|_| acp::Error::internal_error())?;
         rx.await.map_err(|_| acp::Error::internal_error())?;
         Ok(())
+    }
+
+    /// Get default system prompt
+    fn system_prompt(&self) -> String {
+        r#"You are Crow, a helpful software engineering assistant.
+
+You have access to tools to help accomplish tasks. When you're done with a task, call task_complete with a summary.
+
+Be concise and direct. Focus on solving the user's problem efficiently."#
+            .to_string()
     }
 }
 
@@ -142,25 +173,43 @@ impl acp::Agent for CrowAcpAgent {
         // Use the provided cwd for this session
         let working_dir = args.cwd.clone();
 
-        let session_config = Config {
-            working_dir,
-            ..self.config.clone()
-        };
+        // Create agent config
+        let mut agent_config = AgentConfig::new("crow");
+        agent_config.model = Some(self.config.llm.model.clone());
 
-        // Create a new agent for this session
-        let agent = CrowAgent::new(session_config.clone(), self.telemetry.clone());
+        // Create the base agent
+        let agent = BaseAgent::with_telemetry(
+            agent_config,
+            self.provider.clone(),
+            working_dir.clone(),
+            self.telemetry.clone(),
+        );
+
+        // Create tool registry
+        let registry = tools2::create_registry(working_dir.clone());
+        let tools = registry.to_openai_tools();
 
         // Create snapshot manager for this session's working directory
-        let snapshot_manager = SnapshotManager::for_directory(session_config.working_dir.clone());
+        let snapshot_manager = SnapshotManager::for_directory(working_dir);
+
+        // Initialize history with system prompt
+        let history = vec![
+            ChatCompletionRequestSystemMessageArgs::default()
+                .content(self.system_prompt())
+                .build()
+                .map_err(|_| acp::Error::internal_error())?
+                .into(),
+        ];
 
         // Store the session
         self.sessions.borrow_mut().insert(
             session_id_str.clone(),
             Session {
                 agent,
-                history: RefCell::new(Vec::new()),
-                active_hook: RefCell::new(None),
-                cancelled: Cell::new(false),
+                registry,
+                tools,
+                history: RefCell::new(history),
+                cancellation: RefCell::new(None),
                 snapshot_manager,
                 current_snapshot: RefCell::new(None),
                 patches: RefCell::new(Vec::new()),
@@ -216,407 +265,51 @@ impl acp::Agent for CrowAcpAgent {
             }
         };
 
-        // Get the session and start streaming
-        let stream_result = {
+        // Create cancellation token for this prompt
+        let cancellation = CancellationToken::new();
+        {
             let sessions = self.sessions.borrow();
-            let session = sessions
-                .get(&session_id)
-                .ok_or_else(acp::Error::invalid_params)?;
-
-            // Reset cancelled flag at start of new prompt
-            session.cancelled.set(false);
-
-            let history = session.history.borrow().clone();
-            session.agent.chat_stream(&prompt_text, history).await
-        };
-
-        match stream_result {
-            Ok((stream_request, hook)) => {
-                // Store the hook for potential cancellation
-                {
-                    let sessions = self.sessions.borrow();
-                    if let Some(session) = sessions.get(&session_id) {
-                        *session.active_hook.borrow_mut() = Some(hook.clone());
-                    }
-                }
-
-                // Await the request to get the actual stream
-                let mut stream = stream_request.await;
-
-                // Accumulate EVERYTHING for history - on cancel we need to save all of this
-                // This mirrors what rig does internally during multi_turn
-                let mut accumulated_text = String::new();
-                let mut accumulated_tool_calls: Vec<rig::message::ToolCall> = Vec::new();
-                let mut accumulated_tool_results: Vec<rig::message::ToolResult> = Vec::new();
-
-                // Helper to save accumulated state to history
-                // ALWAYS saves the user message, even if assistant hadn't responded yet
-                let save_history = |sessions: &RefCell<HashMap<String, Session>>,
-                                   session_id: &str,
-                                   prompt_text: &str,
-                                   text: &str,
-                                   tool_calls: &[rig::message::ToolCall],
-                                   tool_results: &[rig::message::ToolResult]| {
-                    let sessions_ref = sessions.borrow();
-                    if let Some(session) = sessions_ref.get(session_id) {
-                        let mut history = session.history.borrow_mut();
-
-                        // ALWAYS add user message - even if cancelled before assistant responded
-                        history.push(Message::User {
-                            content: OneOrMany::one(UserContent::text(prompt_text)),
-                        });
-
-                        // Build assistant content - can have both text and tool calls
-                        let mut assistant_content: Vec<AssistantContent> = Vec::new();
-
-                        if !text.is_empty() {
-                            assistant_content.push(AssistantContent::Text(Text {
-                                text: text.to_string(),
-                            }));
-                        }
-
-                        for tc in tool_calls {
-                            assistant_content.push(AssistantContent::ToolCall(tc.clone()));
-                        }
-
-                        // Only add assistant message if there's content
-                        if !assistant_content.is_empty() {
-                            history.push(Message::Assistant {
-                                id: None,
-                                content: OneOrMany::many(assistant_content)
-                                    .expect("we checked it's not empty"),
-                            });
-                        }
-
-                        // Add tool results as user messages
-                        for result in tool_results {
-                            history.push(Message::User {
-                                content: OneOrMany::one(UserContent::ToolResult(result.clone())),
-                            });
-                        }
-
-                        info!("Saved history: {} chars text, {} tool calls, {} results, now {} messages",
-                              text.len(), tool_calls.len(), tool_results.len(), history.len());
-                    }
-                };
-
-                // Process stream items and send updates
-                while let Some(item) = stream.next().await {
-                    // Check if cancelled
-                    {
-                        let sessions = self.sessions.borrow();
-                        if let Some(session) = sessions.get(&session_id) {
-                            if session.cancelled.get() {
-                                info!("Session {} was cancelled, breaking stream loop", session_id);
-                                *session.active_hook.borrow_mut() = None;
-                                drop(sessions);
-
-                                // Save everything we accumulated before cancellation
-                                save_history(
-                                    &self.sessions, &session_id, &prompt_text,
-                                    &accumulated_text, &accumulated_tool_calls, &accumulated_tool_results
-                                );
-
-                                return Ok(PromptResponse::new(StopReason::Cancelled));
-                            }
-                        }
-                    }
-
-                    match item {
-                        Ok(MultiTurnStreamItem::StreamAssistantItem(content)) => {
-                            match content {
-                                StreamedAssistantContent::Text(text) => {
-                                    // Accumulate text for history
-                                    accumulated_text.push_str(&text.text);
-                                    debug!("Accumulated {} chars (total: {})", text.text.len(), accumulated_text.len());
-
-                                    // Stream text chunks immediately
-                                    self.send_update(SessionNotification::new(
-                                        args.session_id.clone(),
-                                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                            ContentBlock::Text(TextContent::new(text.text)),
-                                        )),
-                                    ))
-                                    .await?;
-                                }
-                                StreamedAssistantContent::ToolCall(tool_call) => {
-                                    // Accumulate tool call for history
-                                    accumulated_tool_calls.push(tool_call.clone());
-
-                                    // Send tool call notification
-                                    let tool_call_id = ToolCallId::from(tool_call.id.clone());
-                                    let kind = tool_name_to_kind(&tool_call.function.name);
-                                    let title = format!("Calling {}", tool_call.function.name);
-
-                                    self.send_update(SessionNotification::new(
-                                        args.session_id.clone(),
-                                        SessionUpdate::ToolCall(
-                                            ToolCall::new(tool_call_id, title)
-                                                .kind(kind)
-                                                .status(ToolCallStatus::InProgress)
-                                                .raw_input(tool_call.function.arguments.clone()),
-                                        ),
-                                    ))
-                                    .await?;
-
-                                    // If this is todo_write, also send a Plan update
-                                    if tool_call.function.name == "todo_write" {
-                                        if let Some(plan) =
-                                            parse_todo_write_to_plan(&tool_call.function.arguments)
-                                        {
-                                            self.send_update(SessionNotification::new(
-                                                args.session_id.clone(),
-                                                SessionUpdate::Plan(plan),
-                                            ))
-                                            .await?;
-                                        }
-                                    }
-                                }
-                                StreamedAssistantContent::Reasoning(reasoning) => {
-                                    // Send reasoning as thought chunk
-                                    let text = reasoning.reasoning.join("");
-                                    self.send_update(SessionNotification::new(
-                                        args.session_id.clone(),
-                                        SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                            ContentBlock::Text(TextContent::new(text)),
-                                        )),
-                                    ))
-                                    .await?;
-                                }
-                                StreamedAssistantContent::ToolCallDelta { .. } => {
-                                    // Skip tool call deltas - we handle complete tool calls
-                                }
-                                StreamedAssistantContent::Final(_) => {
-                                    // Final response handled separately
-                                }
-                            }
-                        }
-                        Ok(MultiTurnStreamItem::StreamUserItem(user_content)) => {
-                            // Tool results - accumulate AND send as tool call update
-                            let rig::streaming::StreamedUserContent::ToolResult(result) =
-                                user_content;
-
-                            // Find the tool call that corresponds to this result
-                            let tool_name = accumulated_tool_calls
-                                .iter()
-                                .find(|tc| tc.id == result.id)
-                                .map(|tc| tc.function.name.clone());
-
-                            // Accumulate for history
-                            accumulated_tool_results.push(result.clone());
-
-                            let tool_call_id = ToolCallId::from(result.id.clone());
-                            let result_text = result
-                                .content
-                                .iter()
-                                .filter_map(|c| {
-                                    if let rig::message::ToolResultContent::Text(t) = c {
-                                        Some(t.text.clone())
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n");
-
-                            self.send_update(SessionNotification::new(
-                                args.session_id.clone(),
-                                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                    tool_call_id,
-                                    ToolCallUpdateFields::new()
-                                        .status(ToolCallStatus::Completed)
-                                        .content(vec![result_text.into()]),
-                                )),
-                            ))
-                            .await?;
-
-                            // Check if this was a file-modifying tool and track changes
-                            if let Some(ref name) = tool_name {
-                                let is_file_modifying = matches!(
-                                    name.as_str(),
-                                    "edit_file" | "write" | "terminal" | "bash"
-                                );
-
-                                if is_file_modifying {
-                                    if let Some(ref hash) = snapshot_hash {
-                                        // Get patch info and store it
-                                        let patch_info = {
-                                            let sessions = self.sessions.borrow();
-                                            if let Some(session) = sessions.get(&session_id) {
-                                                if let Ok(patch) = session.snapshot_manager.patch(hash).await {
-                                                    if !patch.files.is_empty() {
-                                                        info!(
-                                                            "Tool {} modified {} files",
-                                                            name,
-                                                            patch.files.len()
-                                                        );
-                                                        let patch_index = session.patches.borrow().len();
-                                                        let files: Vec<String> = patch.files.iter()
-                                                            .map(|f| f.display().to_string())
-                                                            .collect();
-                                                        // Store patch for potential undo
-                                                        session.patches.borrow_mut().push(patch);
-                                                        Some((patch_index, files))
-                                                    } else {
-                                                        None
-                                                    }
-                                                } else {
-                                                    None
-                                                }
-                                            } else {
-                                                None
-                                            }
-                                        };
-
-                                        // Send extension notification about the patch (outside the borrow)
-                                        if let Some((patch_index, files)) = patch_info {
-                                            let patch_data = serde_json::json!({
-                                                "session_id": session_id,
-                                                "patch_index": patch_index,
-                                                "files": files,
-                                                "tool": name
-                                            });
-                                            if let Ok(raw) = serde_json::value::to_raw_value(&patch_data) {
-                                                let ext_notif = ExtNotification::new(
-                                                    "session/patch",
-                                                    raw.into()
-                                                );
-                                                // Fire and forget - don't block on this
-                                                let _ = self.send_ext_notification(ext_notif).await;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Ok(MultiTurnStreamItem::FinalResponse(final_resp)) => {
-                            // Stream completed successfully - update history
-                            info!("Stream completed, updating history");
-
-                            // Use the final response text if available, otherwise use accumulated
-                            let response_text = if !final_resp.response().is_empty() {
-                                final_resp.response().to_string()
-                            } else {
-                                accumulated_text.clone()
-                            };
-
-                            // Update session history
-                            let sessions = self.sessions.borrow();
-                            if let Some(session) = sessions.get(&session_id) {
-                                let mut history = session.history.borrow_mut();
-
-                                // Add user message
-                                history.push(Message::User {
-                                    content: OneOrMany::one(UserContent::text(&prompt_text)),
-                                });
-
-                                // Add assistant response (final response is just text, tool calls already handled in multi-turn)
-                                history.push(Message::Assistant {
-                                    id: None,
-                                    content: OneOrMany::one(AssistantContent::Text(Text {
-                                        text: response_text,
-                                    })),
-                                });
-
-                                info!("History updated, now has {} messages", history.len());
-                                *session.active_hook.borrow_mut() = None;
-                            }
-                        }
-                        Ok(_) => {
-                            // Handle any other MultiTurnStreamItem variants
-                        }
-                        Err(e) => {
-                            // Check if this was a cancellation
-                            let is_cancelled = e.to_string().contains("PromptCancelled");
-
-                            if is_cancelled {
-                                info!("Stream was cancelled via error");
-                                {
-                                    let sessions = self.sessions.borrow();
-                                    if let Some(session) = sessions.get(&session_id) {
-                                        *session.active_hook.borrow_mut() = None;
-                                    }
-                                }
-
-                                // Save everything we accumulated
-                                save_history(
-                                    &self.sessions, &session_id, &prompt_text,
-                                    &accumulated_text, &accumulated_tool_calls, &accumulated_tool_results
-                                );
-
-                                return Ok(PromptResponse::new(StopReason::Cancelled));
-                            }
-
-                            error!("Stream error: {}", e);
-                            self.send_update(SessionNotification::new(
-                                args.session_id.clone(),
-                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                    ContentBlock::Text(TextContent::new(format!("Error: {}", e))),
-                                )),
-                            ))
-                            .await?;
-
-                            {
-                                let sessions = self.sessions.borrow();
-                                if let Some(session) = sessions.get(&session_id) {
-                                    *session.active_hook.borrow_mut() = None;
-                                }
-                            }
-
-                            // Save everything we accumulated before error
-                            save_history(
-                                &self.sessions, &session_id, &prompt_text,
-                                &accumulated_text, &accumulated_tool_calls, &accumulated_tool_results
-                            );
-
-                            return Ok(PromptResponse::new(StopReason::Refusal));
-                        }
-                    }
-                }
-
-                Ok(PromptResponse::new(StopReason::EndTurn))
-            }
-            Err(e) => {
-                error!("Prompt error: {}", e);
-
-                let sessions = self.sessions.borrow();
-                if let Some(session) = sessions.get(&session_id) {
-                    *session.active_hook.borrow_mut() = None;
-                }
-                drop(sessions);
-
-                self.send_update(SessionNotification::new(
-                    args.session_id.clone(),
-                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                        TextContent::new(format!("Error: {}", e)),
-                    ))),
-                ))
-                .await?;
-
-                Ok(PromptResponse::new(StopReason::Refusal))
+            if let Some(session) = sessions.get(&session_id) {
+                *session.cancellation.borrow_mut() = Some(cancellation.clone());
             }
         }
+
+        // Add user message to history
+        {
+            let sessions = self.sessions.borrow();
+            if let Some(session) = sessions.get(&session_id) {
+                let user_msg = ChatCompletionRequestUserMessageArgs::default()
+                    .content(prompt_text.clone())
+                    .build()
+                    .map_err(|_| acp::Error::internal_error())?;
+                session.history.borrow_mut().push(user_msg.into());
+            }
+        }
+
+        // Run the agent turn and stream events
+        let result = self.run_agent_turn(&session_id, &args.session_id, cancellation, snapshot_hash).await;
+
+        // Clear cancellation token
+        {
+            let sessions = self.sessions.borrow();
+            if let Some(session) = sessions.get(&session_id) {
+                *session.cancellation.borrow_mut() = None;
+            }
+        }
+
+        result
     }
 
     async fn cancel(&self, args: CancelNotification) -> acp::Result<()> {
         let session_id = args.session_id.0.to_string();
         info!("ACP cancel: session_id={}", session_id);
 
-        // Set cancelled flag and trigger hook cancel
         let sessions = self.sessions.borrow();
         if let Some(session) = sessions.get(&session_id) {
-            // Set the cancelled flag - this will be checked in the stream loop
-            session.cancelled.set(true);
-            info!("Set cancelled flag for session {}", session_id);
-
-            // Also trigger the hook's cancel signal for interrupting tool execution
-            let hook = session.active_hook.borrow();
-            if let Some(ref h) = *hook {
-                info!("Triggering cancel signal for session {}", session_id);
-                h.cancel().await;
+            if let Some(ref token) = *session.cancellation.borrow() {
+                info!("Cancelling session {}", session_id);
+                token.cancel();
             }
-        } else {
-            info!("Session {} not found for cancel", session_id);
         }
 
         Ok(())
@@ -630,14 +323,12 @@ impl acp::Agent for CrowAcpAgent {
         Err(acp::Error::method_not_found())
     }
 
-
     async fn ext_method(&self, args: ExtRequest) -> acp::Result<ExtResponse> {
         info!("ACP ext_method: {}", args.method);
 
         match &*args.method {
             "session/revert" => {
                 // Revert to a previous snapshot
-                // Expected params: { "session_id": "...", "patch_index": N } or { "session_id": "...", "all": true }
                 let params = serde_json::from_str::<serde_json::Value>(args.params.get())
                     .unwrap_or(serde_json::Value::Null);
 
@@ -652,7 +343,6 @@ impl acp::Agent for CrowAcpAgent {
                 let patches = session.patches.borrow();
 
                 if patches.is_empty() {
-                    info!("No patches to revert for session {}", session_id);
                     return Ok(ExtResponse::new(
                         serde_json::value::RawValue::from_string(
                             r#"{"reverted": false, "reason": "no patches available"}"#.to_string()
@@ -660,7 +350,6 @@ impl acp::Agent for CrowAcpAgent {
                     ));
                 }
 
-                // Check if we're reverting all or just the last one
                 let revert_all = params.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
                 let patch_index = params.get("patch_index").and_then(|v| v.as_u64());
 
@@ -677,13 +366,11 @@ impl acp::Agent for CrowAcpAgent {
                         ));
                     }
                 } else {
-                    // Default: revert the last patch
                     vec![patches.last().unwrap().clone()]
                 };
 
                 drop(patches);
 
-                // Perform the revert
                 match session.snapshot_manager.revert(&patches_to_revert).await {
                     Ok(()) => {
                         let reverted_count = patches_to_revert.len();
@@ -692,10 +379,6 @@ impl acp::Agent for CrowAcpAgent {
                             .flat_map(|p| p.files.iter().map(|f| f.display().to_string()))
                             .collect();
 
-                        info!("Reverted {} patches ({} files) for session {}",
-                              reverted_count, files_reverted.len(), session_id);
-
-                        // Remove reverted patches from the list
                         let mut patches = session.patches.borrow_mut();
                         if revert_all {
                             patches.clear();
@@ -730,7 +413,6 @@ impl acp::Agent for CrowAcpAgent {
             }
 
             "session/patches" => {
-                // List available patches for a session
                 let params = serde_json::from_str::<serde_json::Value>(args.params.get())
                     .unwrap_or(serde_json::Value::Null);
 
@@ -759,7 +441,6 @@ impl acp::Agent for CrowAcpAgent {
             }
 
             _ => {
-                // Unknown extension method
                 Ok(ExtResponse::new(
                     serde_json::value::RawValue::from_string("null".to_string())
                         .unwrap()
@@ -772,6 +453,238 @@ impl acp::Agent for CrowAcpAgent {
     async fn ext_notification(&self, args: ExtNotification) -> acp::Result<()> {
         info!("ACP ext_notification: {}", args.method);
         Ok(())
+    }
+}
+
+impl CrowAcpAgent {
+    /// Run the agent turn and stream events to ACP client
+    async fn run_agent_turn(
+        &self,
+        session_id: &str,
+        acp_session_id: &SessionId,
+        cancellation: CancellationToken,
+        snapshot_hash: Option<String>,
+    ) -> acp::Result<PromptResponse> {
+        // Get session data we need
+        let (agent, registry, tools, messages) = {
+            let sessions = self.sessions.borrow();
+            let session = sessions.get(session_id)
+                .ok_or_else(acp::Error::invalid_params)?;
+            let history = session.history.borrow().clone();
+            (
+                session.agent.clone(),
+                session.registry.clone(),
+                session.tools.clone(),
+                history,
+            )
+        };
+
+        // Create event channel
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+
+        // Run agent turn in background
+        let agent_clone = agent.clone();
+        let registry_clone = registry.clone();
+        let tools_clone = tools.clone();
+        let cancel_clone = cancellation.clone();
+
+        let turn_handle = tokio::task::spawn_local(async move {
+            agent_clone.execute_turn(
+                &mut messages.clone(),
+                &tools_clone,
+                &registry_clone,
+                &event_tx,
+                cancel_clone,
+            ).await
+        });
+
+        // Process events and send to ACP client
+        let mut final_reason = TurnCompleteReason::TextResponse;
+        let mut accumulated_text = String::new();
+
+        while let Some(event) = event_rx.recv().await {
+            match event {
+                AgentEvent::TextDelta { delta, .. } => {
+                    accumulated_text.push_str(&delta);
+                    self.send_update(SessionNotification::new(
+                        acp_session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                            ContentBlock::Text(TextContent::new(delta)),
+                        )),
+                    )).await?;
+                }
+
+                AgentEvent::ThinkingDelta { delta, .. } => {
+                    self.send_update(SessionNotification::new(
+                        acp_session_id.clone(),
+                        SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                            ContentBlock::Text(TextContent::new(delta)),
+                        )),
+                    )).await?;
+                }
+
+                AgentEvent::ToolCallStart { call_id, tool, arguments, .. } => {
+                    let tool_call_id = ToolCallId::from(call_id);
+                    let kind = tool_name_to_kind(&tool);
+                    let title = format!("Calling {}", tool);
+
+                    self.send_update(SessionNotification::new(
+                        acp_session_id.clone(),
+                        SessionUpdate::ToolCall(
+                            ToolCall::new(tool_call_id, title)
+                                .kind(kind)
+                                .status(ToolCallStatus::InProgress)
+                                .raw_input(arguments.clone()),
+                        ),
+                    )).await?;
+
+                    // Handle todo_write specially
+                    if tool == "todo_write" {
+                        if let Some(plan) = parse_todo_write_to_plan(&arguments) {
+                            self.send_update(SessionNotification::new(
+                                acp_session_id.clone(),
+                                SessionUpdate::Plan(plan),
+                            )).await?;
+                        }
+                    }
+                }
+
+                AgentEvent::ToolCallEnd { call_id, tool, output, is_error, .. } => {
+                    let tool_call_id = ToolCallId::from(call_id);
+                    let status = if is_error {
+                        ToolCallStatus::Failed
+                    } else {
+                        ToolCallStatus::Completed
+                    };
+
+                    self.send_update(SessionNotification::new(
+                        acp_session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                            tool_call_id,
+                            ToolCallUpdateFields::new()
+                                .status(status)
+                                .content(vec![output.clone().into()]),
+                        )),
+                    )).await?;
+
+                    // Track file changes for undo
+                    if let Some(ref hash) = snapshot_hash {
+                        let is_file_modifying = matches!(
+                            tool.as_str(),
+                            "edit_file" | "write" | "terminal" | "bash"
+                        );
+
+                        if is_file_modifying {
+                            let patch_info = {
+                                let sessions = self.sessions.borrow();
+                                if let Some(session) = sessions.get(session_id) {
+                                    if let Ok(patch) = session.snapshot_manager.patch(hash).await {
+                                        if !patch.files.is_empty() {
+                                            let patch_index = session.patches.borrow().len();
+                                            let files: Vec<String> = patch.files.iter()
+                                                .map(|f| f.display().to_string())
+                                                .collect();
+                                            session.patches.borrow_mut().push(patch);
+                                            Some((patch_index, files))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some((patch_index, files)) = patch_info {
+                                let patch_data = serde_json::json!({
+                                    "session_id": session_id,
+                                    "patch_index": patch_index,
+                                    "files": files,
+                                    "tool": tool
+                                });
+                                if let Ok(raw) = serde_json::value::to_raw_value(&patch_data) {
+                                    let _ = self.send_ext_notification(
+                                        ExtNotification::new("session/patch", raw.into())
+                                    ).await;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                AgentEvent::TurnComplete { reason, .. } => {
+                    final_reason = reason;
+                }
+
+                AgentEvent::Cancelled { .. } => {
+                    final_reason = TurnCompleteReason::Cancelled;
+                }
+
+                AgentEvent::Error { error, .. } => {
+                    self.send_update(SessionNotification::new(
+                        acp_session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                            ContentBlock::Text(TextContent::new(format!("Error: {}", error))),
+                        )),
+                    )).await?;
+                }
+
+                AgentEvent::Usage { input_tokens, output_tokens, .. } => {
+                    debug!("Token usage: {} in, {} out", input_tokens, output_tokens);
+                }
+
+                _ => {}
+            }
+        }
+
+        // Wait for turn to complete
+        let turn_result = turn_handle.await
+            .map_err(|_| acp::Error::internal_error())?
+            .map_err(|e| {
+                error!("Turn failed: {}", e);
+                acp::Error::internal_error()
+            })?;
+
+        // Update history with the turn result
+        {
+            let sessions = self.sessions.borrow();
+            if let Some(session) = sessions.get(session_id) {
+                let mut history = session.history.borrow_mut();
+
+                // Add assistant message with text and/or tool calls
+                if let Some(ref text) = turn_result.text {
+                    let assistant_msg = ChatCompletionRequestAssistantMessageArgs::default()
+                        .content(text.clone())
+                        .build()
+                        .map_err(|_| acp::Error::internal_error())?;
+                    history.push(assistant_msg.into());
+                }
+
+                // Add tool results
+                for tc in &turn_result.tool_calls {
+                    let tool_msg = ChatCompletionRequestToolMessageArgs::default()
+                        .tool_call_id(&tc.id)
+                        .content(tc.output.clone())
+                        .build()
+                        .map_err(|_| acp::Error::internal_error())?;
+                    history.push(tool_msg.into());
+                }
+
+                info!("History updated, now has {} messages", history.len());
+            }
+        }
+
+        // Map to ACP stop reason
+        let stop_reason = match final_reason {
+            TurnCompleteReason::TextResponse => StopReason::EndTurn,
+            TurnCompleteReason::TaskComplete { .. } => StopReason::EndTurn,
+            TurnCompleteReason::MaxIterations => StopReason::EndTurn,
+            TurnCompleteReason::Cancelled => StopReason::Cancelled,
+        };
+
+        Ok(PromptResponse::new(stop_reason))
     }
 }
 
@@ -829,7 +742,11 @@ pub async fn run_stdio_server(config: Config, telemetry: Arc<Telemetry>) -> acp:
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     // Create the agent
-    let agent = CrowAcpAgent::new(tx, config, telemetry);
+    let agent = CrowAcpAgent::new(tx, config, telemetry)
+        .map_err(|e| {
+            error!("Failed to create agent: {}", e);
+            acp::Error::internal_error()
+        })?;
 
     // Start the connection
     let (conn, handle_io) =
