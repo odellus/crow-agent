@@ -506,13 +506,10 @@ impl Agent {
     /// This links the two session IDs so they share the same todo state.
     /// Must be called before running the agent if you want shared todos.
     ///
-    /// Also sets the coagent's session_id_override so it logs traces with its own
-    /// internal session ID (not the primary's session ID).
-    ///
     /// # Arguments
     /// * `todo_store` - The shared TodoStore instance
     /// * `primary_session_id` - Session ID for the primary agent's todo tools
-    /// * `coagent_session_id` - Session ID for the coagent's todo tools
+    /// * `coagent_session_id` - Session ID for the coagent's todo tools (usually same as primary)
     pub fn with_shared_todos(
         mut self,
         todo_store: TodoStore,
@@ -524,14 +521,6 @@ impl Agent {
 
         // Link the sessions so they share the same underlying todo storage
         todo_store.share_sessions(&primary_id, &coagent_id);
-
-        // Set coagent's session_id_override for trace logging
-        // This ensures coagent traces have their own internal session ID
-        if let Some(ref mut coagent) = self.coagent {
-            if let Ok(uuid) = uuid::Uuid::parse_str(&coagent_id) {
-                coagent.session_id_override = Some(uuid);
-            }
-        }
 
         self.todo_store = Some(todo_store);
         self.primary_session_id = Some(primary_id);
