@@ -28,3 +28,12 @@
 
 ## General
 - Don't be incompetent
+
+## Telemetry
+Use this to get the most recent messages
+```bash
+# most recent messages
+crow-agent trace -j -f $(crow-agent traces -j -n 1 | jq -r '.[0].id') | jq '.request_messages'
+# show all the keys in the json output
+crow-agent trace -j -f $(crow-agent traces -j -n 1 | jq -r '.[0].id') | jq 'keys'
+```

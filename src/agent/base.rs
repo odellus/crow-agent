@@ -11,7 +11,7 @@
 use crate::agent::AgentConfig;
 use crate::events::{AgentEvent, ExecutedToolCall, TokenUsage, TurnCompleteReason, TurnResult};
 use crate::provider::{ProviderClient, StreamDelta};
-use crate::telemetry::{Telemetry, TraceGuard};
+use crate::telemetry::{Telemetry, TraceBuilder, TraceGuard};
 use async_openai::types::{
     ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
     ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs, ChatCompletionTool,
@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 /// Internal agent that runs the ReAct loop
 #[derive(Clone)]
@@ -37,6 +38,9 @@ pub struct BaseAgent {
     working_dir: PathBuf,
     /// Telemetry (optional)
     telemetry: Option<Arc<Telemetry>>,
+    /// Session ID override - when set, traces use this instead of telemetry's session_id
+    /// This is used for coagents which need their own internal session ID
+    pub session_id_override: Option<Uuid>,
 }
 
 impl BaseAgent {
@@ -55,6 +59,7 @@ impl BaseAgent {
             provider,
             working_dir,
             telemetry: None,
+            session_id_override: None,
         }
     }
 
@@ -71,7 +76,15 @@ impl BaseAgent {
             provider,
             working_dir,
             telemetry: Some(telemetry),
+            session_id_override: None,
         }
+    }
+
+    /// Set session ID override for trace logging
+    /// Used for coagents that need their own internal session ID
+    pub fn with_session_id(mut self, session_id: Uuid) -> Self {
+        self.session_id_override = Some(session_id);
+        self
     }
 
     /// Execute a full turn (ReAct loop until done)
@@ -133,7 +146,11 @@ impl BaseAgent {
             let mut trace_guard = self.telemetry.as_ref().map(|t| {
                 let msgs_json = serde_json::to_string(&messages).unwrap_or_default();
                 let tools_json = serde_json::to_string(&tools).ok();
-                let builder = t.start_trace(
+
+                // Use session_id_override if set (for coagents), otherwise use telemetry's session_id
+                let session_id = self.session_id_override.unwrap_or_else(|| t.session_id());
+                let builder = TraceBuilder::new(
+                    session_id,
                     &self.name,
                     &self.provider.config().name,
                     &model_name,
@@ -274,10 +291,9 @@ impl BaseAgent {
                 }
             }
 
-            // Complete trace (or let it drop to save partial data)
-            if let Some(guard) = trace_guard.take() {
-                guard.complete();
-            }
+            // NOTE: Don't complete trace here - wait until after tool execution
+            // so we can capture the final message state including tool results
+            // The trace will be completed after tools run, or on early return
 
             // Emit thinking complete if present
             if !accumulated_thinking.is_empty() {
@@ -291,11 +307,27 @@ impl BaseAgent {
             // No tool calls = done
             if tool_call_parts.is_empty() {
                 if !accumulated_text.is_empty() {
+                    // Add assistant message to context before returning
+                    // This is critical for coagent sessions to maintain correct message ordering
+                    messages.push(ChatCompletionRequestMessage::Assistant(
+                        ChatCompletionRequestAssistantMessageArgs::default()
+                            .content(accumulated_text.clone())
+                            .build()
+                            .map_err(|e| format!("Failed to build assistant message: {}", e))?,
+                    ));
+
                     let _ = event_tx.send(AgentEvent::TextComplete {
                         agent: self.name.clone(),
                         text: accumulated_text.clone(),
                     });
                     final_text = Some(accumulated_text);
+                }
+
+                // Complete trace with final message state
+                if let Some(mut guard) = trace_guard.take() {
+                    let msgs_json = serde_json::to_string(&messages).unwrap_or_default();
+                    guard.update_request_messages(msgs_json);
+                    guard.complete();
                 }
 
                 let _ = event_tx.send(AgentEvent::TurnComplete {
@@ -407,6 +439,13 @@ impl BaseAgent {
 
                 // CRITICAL: Check for task_complete
                 if tool_name == "task_complete" && !is_error {
+                    // Complete trace with final message state including task_complete result
+                    if let Some(mut guard) = trace_guard.take() {
+                        let msgs_json = serde_json::to_string(&messages).unwrap_or_default();
+                        guard.update_request_messages(msgs_json);
+                        guard.complete();
+                    }
+
                     let _ = event_tx.send(AgentEvent::TurnComplete {
                         agent: self.name.clone(),
                         reason: TurnCompleteReason::TaskComplete {
@@ -423,6 +462,13 @@ impl BaseAgent {
                         files_changed,
                     });
                 }
+            }
+
+            // Complete trace after all tools in this iteration (if not already taken by task_complete)
+            if let Some(mut guard) = trace_guard.take() {
+                let msgs_json = serde_json::to_string(&messages).unwrap_or_default();
+                guard.update_request_messages(msgs_json);
+                guard.complete();
             }
 
             // Continue to next iteration

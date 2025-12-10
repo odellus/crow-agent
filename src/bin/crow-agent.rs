@@ -243,8 +243,14 @@ impl CrowCli {
                 }
             };
 
-            // Generate unique coagent session ID
-            let coagent_session_id = format!("{}-coagent", session_id);
+            // Generate unique coagent session ID (proper UUID for trace logging)
+            let coagent_session_uuid = uuid::Uuid::new_v4();
+            let coagent_session_id = coagent_session_uuid.to_string();
+
+            // Create coagent session in database (required for foreign key constraint on traces)
+            if let Err(e) = telemetry.create_coagent_session(coagent_session_uuid) {
+                tracing::warn!("Failed to create coagent session: {}", e);
+            }
 
             // Create agent with coagent and shared todos
             let agent = Agent::with_coagent_and_telemetry(

@@ -482,6 +482,12 @@ impl TraceGuard {
         self.error = Some(error.into());
     }
 
+    /// Update request messages with final state
+    /// Used when task_complete is called to capture the complete message history
+    pub fn update_request_messages(&mut self, messages: impl Into<String>) {
+        self.request_messages = messages.into();
+    }
+
     /// Flush current state to database - call periodically during streaming
     /// for SIGTERM protection. Safe to call multiple times.
     pub fn flush(&mut self) {
@@ -974,6 +980,17 @@ impl Telemetry {
     /// This replaces the current session with the specified ID
     pub fn resume_session(&self, session_id: Uuid) {
         *self.session.write().unwrap() = Arc::new(TelemetrySession::with_id(session_id));
+    }
+
+    /// Create a coagent session in the database
+    /// This is needed because traces have a foreign key to sessions
+    /// The coagent has its own session_id for trace logging
+    pub fn create_coagent_session(&self, coagent_session_id: Uuid) -> anyhow::Result<()> {
+        let session = TelemetrySession::with_id(coagent_session_id);
+        if let Ok(db) = self.db.lock() {
+            db.insert_session(&session, None, None, None)?;
+        }
+        Ok(())
     }
 
     /// Log a user message

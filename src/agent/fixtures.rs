@@ -7,20 +7,21 @@ use crate::events::{ExecutedToolCall, TurnResult};
 use serde_json::Value;
 
 /// Convert a TurnResult into a condensed markdown summary
+/// Tool calls come first (in order), then final text response
 pub fn humanize_turn(result: &TurnResult) -> String {
     let mut parts = Vec::new();
 
-    // Add any text response
-    if let Some(ref text) = result.text {
-        let trimmed = trim_text(text, 500);
-        parts.push(trimmed);
-    }
-
-    // Add humanized tool calls
+    // Add humanized tool calls first (preserves execution order)
     for call in &result.tool_calls {
         if let Some(summary) = humanize_tool_call(call) {
             parts.push(summary);
         }
+    }
+
+    // Add final text response last
+    if let Some(ref text) = result.text {
+        let trimmed = trim_text(text, 500);
+        parts.push(trimmed);
     }
 
     parts.join("\n\n")
@@ -39,7 +40,9 @@ fn humanize_tool_call(call: &ExecutedToolCall) -> Option<String> {
         }
 
         "read_file" | "read" => {
-            let path = args.get("path").and_then(|v| v.as_str())?;
+            let path = args.get("filePath")
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())?;
             let lines = output.lines().count();
             Some(format!("read `{}` ({} lines)", path, lines))
         }
