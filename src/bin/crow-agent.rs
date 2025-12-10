@@ -150,6 +150,10 @@ enum Commands {
         /// Output as JSON
         #[arg(short, long)]
         json: bool,
+
+        /// Include coagent traces (by default only primary agents are shown)
+        #[arg(long)]
+        coagent: bool,
     },
 
     /// Show a specific trace's full details
@@ -1168,56 +1172,75 @@ async fn replay_session(telemetry: &Telemetry, session_prefix: &str, _continue_s
     Ok(())
 }
 
-fn show_traces(telemetry: &Telemetry, limit: usize, json: bool) -> Result<()> {
+fn show_traces(telemetry: &Telemetry, limit: usize, json: bool, include_coagent: bool) -> Result<()> {
     use rusqlite::Connection;
 
     let conn = Connection::open(telemetry.db_path())?;
-    let mut stmt = conn.prepare(&format!(
-        r#"SELECT id, session_id, started_at, latency_ms, model_id,
-                  substr(response_content, 1, 60) as preview
-           FROM traces
-           ORDER BY started_at DESC
-           LIMIT {}"#,
-        limit
-    ))?;
 
-    let rows = stmt.query_map([], |row| {
+    // By default filter to primary agents only, --coagent shows all
+    let query = if include_coagent {
+        format!(
+            r#"SELECT id, session_id, started_at, latency_ms, model_id,
+                      substr(response_content, 1, 60) as preview, agent_name
+               FROM traces
+               ORDER BY started_at DESC
+               LIMIT {}"#,
+            limit
+        )
+    } else {
+        format!(
+            r#"SELECT id, session_id, started_at, latency_ms, model_id,
+                      substr(response_content, 1, 60) as preview, agent_name
+               FROM traces
+               WHERE agent_name NOT LIKE '%judge%' OR agent_name IS NULL
+               ORDER BY started_at DESC
+               LIMIT {}"#,
+            limit
+        )
+    };
+
+    let mut stmt = conn.prepare(&query)?;
+
+    type TraceRow = (String, String, String, Option<i64>, Option<String>, Option<String>, Option<String>);
+
+    let collected: Vec<TraceRow> = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
         ))
-    })?;
+    })?.filter_map(|r| r.ok()).collect();
 
     if json {
         let mut traces = Vec::new();
-        for row in rows {
-            let (id, session_id, started_at, latency_ms, model, _preview) = row?;
+        for (id, session_id, started_at, latency_ms, model, _preview, agent_name) in collected {
             traces.push(serde_json::json!({
                 "id": id,
                 "session_id": session_id,
                 "started_at": started_at,
                 "latency_ms": latency_ms,
                 "model_id": model,
+                "agent_name": agent_name,
             }));
         }
         println!("{}", serde_json::to_string_pretty(&traces)?);
         return Ok(());
     }
 
-    println!("Recent Traces:");
-    println!("{:-<100}", "");
+    println!("Recent Traces{}:", if include_coagent { " (including coagents)" } else { "" });
+    println!("{:-<110}", "");
 
-    for row in rows {
-        let (id, session_id, started_at, latency_ms, model, preview) = row?;
+    for (id, session_id, started_at, latency_ms, model, preview, agent_name) in collected {
         let latency = latency_ms
             .map(|ms| format!("{}ms", ms))
             .unwrap_or_else(|| "?".to_string());
         let model = model.unwrap_or_else(|| "?".to_string());
         let preview = preview.unwrap_or_default();
+        let agent = agent_name.unwrap_or_else(|| "?".to_string());
 
         let time = started_at
             .split('T')
@@ -1225,15 +1248,28 @@ fn show_traces(telemetry: &Telemetry, limit: usize, json: bool) -> Result<()> {
             .and_then(|t| t.split('.').next())
             .unwrap_or(&started_at);
 
-        println!(
-            "{} {} {:>8} [{}] {} {}",
-            time,
-            &id[..8],
-            latency,
-            &session_id[..8],
-            model,
-            preview
-        );
+        if include_coagent {
+            println!(
+                "{} {} {:>8} [{}] {:12} {} {}",
+                time,
+                &id[..8],
+                latency,
+                &session_id[..8],
+                agent,
+                model,
+                preview
+            );
+        } else {
+            println!(
+                "{} {} {:>8} [{}] {} {}",
+                time,
+                &id[..8],
+                latency,
+                &session_id[..8],
+                model,
+                preview
+            );
+        }
     }
     Ok(())
 }
@@ -1489,8 +1525,8 @@ async fn main() -> Result<()> {
         Some(Commands::Query { sql }) => {
             return run_query(&telemetry, sql);
         }
-        Some(Commands::Traces { limit, json }) => {
-            return show_traces(&telemetry, *limit, *json);
+        Some(Commands::Traces { limit, json, coagent }) => {
+            return show_traces(&telemetry, *limit, *json, *coagent);
         }
         Some(Commands::Trace { id, full, json }) => {
             return show_trace(&telemetry, id, *full, *json);
