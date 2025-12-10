@@ -231,22 +231,37 @@ impl ProviderClient {
             "model": model,
             "messages": messages_json,
             "stream": true,
-            "stream_options": {"include_usage": true}
+            "stream_options": {"include_usage": true},
+            // llama.cpp/LM Studio: enable prompt caching for faster responses
+            "cache_prompt": true
         });
 
         if !tools.is_empty() {
             body["tools"] = serde_json::json!(tools_json);
         }
 
-        let response = self
+        // Make the HTTP request cancellable - this is critical for llama.cpp
+        // which can take minutes during prompt processing
+        let request_fut = self
             .http_client
             .post(format!("{}/chat/completions", self.config.base_url))
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
             .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("API request failed: {}", e))?;
+            .send();
+
+        let response = if let Some(ref token) = cancellation {
+            tokio::select! {
+                biased;
+                _ = token.cancelled() => {
+                    let _ = tx.send(StreamDelta::Done);
+                    return Err("Request cancelled during prompt processing".to_string());
+                }
+                result = request_fut => result.map_err(|e| format!("API request failed: {}", e))?,
+            }
+        } else {
+            request_fut.await.map_err(|e| format!("API request failed: {}", e))?
+        };
 
         if !response.status().is_success() {
             let status = response.status();
@@ -261,6 +276,9 @@ impl ProviderClient {
             // Check for cancellation
             if let Some(ref token) = cancellation {
                 if token.is_cancelled() {
+                    // Drop the stream explicitly to close the HTTP connection
+                    // This signals llama.cpp to cancel the request
+                    drop(stream);
                     let _ = tx.send(StreamDelta::Done);
                     return Err("Stream cancelled".to_string());
                 }
@@ -271,6 +289,8 @@ impl ProviderClient {
                 tokio::select! {
                     biased;
                     _ = token.cancelled() => {
+                        // Drop the stream explicitly to close the HTTP connection
+                        drop(stream);
                         let _ = tx.send(StreamDelta::Done);
                         return Err("Stream cancelled".to_string());
                     }

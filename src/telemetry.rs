@@ -213,8 +213,9 @@ impl TelemetryDb {
     }
 
     fn insert_interaction(&self, record: &InteractionRecord) -> anyhow::Result<()> {
+        // Use INSERT OR REPLACE so InteractionGuard can flush() multiple times
         self.conn.execute(
-            r#"INSERT INTO interactions
+            r#"INSERT OR REPLACE INTO interactions
                (id, session_id, timestamp, interaction_type, duration_ms,
                 prompt_tokens, completion_tokens, total_tokens, model,
                 content, raw_request, raw_response, error)
@@ -478,6 +479,143 @@ impl Drop for TraceGuard {
     fn drop(&mut self) {
         if !self.completed {
             // Save whatever we accumulated before being dropped
+            self.save_impl();
+        }
+    }
+}
+
+/// Guard for external session interactions - saves assistant output on drop
+///
+/// Similar to TraceGuard, this ensures partial output is saved even on cancellation.
+/// Use for the `interactions` table which tracks the external session (what the user sees).
+pub struct InteractionGuard {
+    telemetry: Arc<Telemetry>,
+    id: Uuid,  // Stable ID for INSERT OR REPLACE
+    started_at: DateTime<Utc>,
+    model: Option<String>,
+    // Accumulated output
+    content: String,
+    // Set when explicitly completed
+    completed: bool,
+}
+
+impl InteractionGuard {
+    pub fn new(telemetry: Arc<Telemetry>, model: Option<String>) -> Self {
+        Self {
+            telemetry,
+            id: Uuid::new_v4(),  // Generate once, reuse on each flush
+            started_at: Utc::now(),
+            model,
+            content: String::new(),
+            completed: false,
+        }
+    }
+
+    /// Append text to the accumulated output
+    pub fn push_text(&mut self, text: &str) {
+        self.content.push_str(text);
+    }
+
+    /// Append thinking in a tag
+    pub fn push_thinking(&mut self, text: &str) {
+        // Add thinking tag if not already in one
+        if !self.content.ends_with("<thinking>") && !self.content.contains("<thinking>") {
+            self.content.push_str("<thinking>");
+        }
+        self.content.push_str(text);
+    }
+
+    /// Close thinking tag
+    pub fn end_thinking(&mut self) {
+        if self.content.contains("<thinking>") && !self.content.ends_with("</thinking>\n") {
+            self.content.push_str("</thinking>\n");
+        }
+    }
+
+    /// Append tool call info
+    pub fn push_tool_call(&mut self, tool: &str, args_preview: &str) {
+        self.content.push_str(&format!("\n[Tool: {} {}]\n", tool, args_preview));
+    }
+
+    /// Append tool result
+    pub fn push_tool_result(&mut self, preview: &str) {
+        self.content.push_str(&format!("[Tool Result: {}]\n", preview));
+    }
+
+    /// Append tool error
+    pub fn push_tool_error(&mut self, error: &str) {
+        self.content.push_str(&format!("[Tool Error: {}]\n", error));
+    }
+
+    /// Append coagent info
+    pub fn push_coagent_start(&mut self, coagent: &str, primary: &str) {
+        self.content.push_str(&format!("\n[Coagent {} reviewing {}]\n", coagent, primary));
+    }
+
+    /// Append coagent end
+    pub fn push_coagent_end(&mut self, coagent: &str) {
+        self.content.push_str(&format!("[Coagent {} done]\n", coagent));
+    }
+
+    /// Append error
+    pub fn push_error(&mut self, error: &str) {
+        self.content.push_str(&format!("[Error: {}]\n", error));
+    }
+
+    /// Flush current state to database - call periodically during streaming
+    pub fn flush(&self) {
+        self.save_impl();
+    }
+
+    /// Get current content length (for deciding when to flush)
+    pub fn len(&self) -> usize {
+        self.content.len()
+    }
+
+    /// Check if empty
+    pub fn is_empty(&self) -> bool {
+        self.content.is_empty()
+    }
+
+    /// Explicitly complete (prevents drop from saving again)
+    pub fn complete(mut self) {
+        self.save_impl();
+        self.completed = true;
+    }
+
+    fn save_impl(&self) {
+        if self.content.is_empty() {
+            return;
+        }
+
+        let duration_ms = (Utc::now() - self.started_at).num_milliseconds() as u64;
+
+        // Save synchronously to the database (uses stable ID for INSERT OR REPLACE)
+        let record = InteractionRecord {
+            id: self.id,
+            session_id: self.telemetry.session_id(),
+            timestamp: Utc::now(),
+            interaction_type: InteractionType::AssistantMessage,
+            duration_ms: Some(duration_ms),
+            prompt_tokens: None,
+            completion_tokens: None,
+            total_tokens: None,
+            model: self.model.clone(),
+            content: Some(self.content.clone()),
+            raw_request: None,
+            raw_response: None,
+            error: None,
+        };
+
+        if let Ok(db) = self.telemetry.db.lock() {
+            let _ = db.insert_interaction(&record);
+        }
+    }
+}
+
+impl Drop for InteractionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
             self.save_impl();
         }
     }

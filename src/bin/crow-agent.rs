@@ -23,8 +23,39 @@ use tokio_util::sync::CancellationToken;
 /// Global cancellation token for signal handling
 static SHUTDOWN: std::sync::OnceLock<CancellationToken> = std::sync::OnceLock::new();
 
+/// Global interaction guard - set during run_agent, flushed on signal
+static INTERACTION_GUARD: std::sync::OnceLock<std::sync::Mutex<Option<Arc<tokio::sync::Mutex<crow_agent::InteractionGuard>>>>> = std::sync::OnceLock::new();
+
 fn get_shutdown_token() -> CancellationToken {
     SHUTDOWN.get_or_init(CancellationToken::new).clone()
+}
+
+fn set_global_guard(guard: Arc<tokio::sync::Mutex<crow_agent::InteractionGuard>>) {
+    let slot = INTERACTION_GUARD.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(guard);
+    }
+}
+
+fn clear_global_guard() {
+    if let Some(slot) = INTERACTION_GUARD.get() {
+        if let Ok(mut g) = slot.lock() {
+            *g = None;
+        }
+    }
+}
+
+fn flush_global_guard() {
+    if let Some(slot) = INTERACTION_GUARD.get() {
+        if let Ok(g) = slot.lock() {
+            if let Some(ref guard) = *g {
+                // Try to flush - use blocking lock since we're in signal context
+                if let Ok(inner) = guard.try_lock() {
+                    inner.flush();
+                }
+            }
+        }
+    }
 }
 
 /// Get the default data directory
@@ -288,14 +319,15 @@ impl CrowCli {
     }
 
     /// Run the agent until completion or user input needed
-    /// Returns (RunResult, accumulated_output) where accumulated_output is the full
-    /// external session content (all text, tool calls, thinking from all agents)
+    /// Returns RunResult. Interaction logging is handled by InteractionGuard which
+    /// saves to DB on drop, surviving cancellation.
     async fn run_agent(
         &mut self,
         messages: &mut Vec<async_openai::types::ChatCompletionRequestMessage>,
         cancellation: CancellationToken,
-    ) -> Result<(RunResult, String)> {
+    ) -> Result<RunResult> {
         use crow_agent::agent::init_coagent_session;
+        use crow_agent::InteractionGuard;
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
@@ -304,6 +336,7 @@ impl CrowCli {
         let tools = self.tools.clone();
         let verbose = self.verbose;
         let telemetry = self.telemetry.clone();
+        let model = self.model.clone();
 
         // Initialize coagent messages if we have a coagent
         let mut coagent_messages: Option<Vec<async_openai::types::ChatCompletionRequestMessage>> =
@@ -335,9 +368,11 @@ impl CrowCli {
             cancellation,
         );
 
-        // Accumulate all output for the external session log
-        let accumulated = Arc::new(Mutex::new(String::new()));
-        let accumulated_clone = accumulated.clone();
+        // InteractionGuard accumulates the full turn and saves on drop
+        // Register globally so signal handler can flush on Ctrl+C/SIGTERM
+        let guard = Arc::new(Mutex::new(InteractionGuard::new(telemetry.clone(), Some(model))));
+        set_global_guard(guard.clone());
+        let guard_clone = guard.clone();
 
         let event_fut = async move {
             while let Some(event) = rx.recv().await {
@@ -345,24 +380,15 @@ impl CrowCli {
                     AgentEvent::TextDelta { delta, .. } => {
                         print!("{}", delta);
                         std::io::stdout().flush().ok();
-                        // Accumulate for external session
-                        accumulated_clone.lock().await.push_str(delta);
+                        guard_clone.lock().await.push_text(delta);
                     }
                     AgentEvent::ThinkingDelta { delta, .. } => {
                         print!("\x1b[90m{}\x1b[0m", delta);
                         std::io::stdout().flush().ok();
-                        // Accumulate thinking in a tag for external session
-                        let mut acc = accumulated_clone.lock().await;
-                        if !acc.ends_with("<thinking>") && !acc.contains("<thinking>") {
-                            acc.push_str("<thinking>");
-                        }
-                        acc.push_str(delta);
+                        guard_clone.lock().await.push_thinking(delta);
                     }
                     AgentEvent::ThinkingComplete { .. } => {
-                        let mut acc = accumulated_clone.lock().await;
-                        if acc.contains("<thinking>") && !acc.ends_with("</thinking>\n") {
-                            acc.push_str("</thinking>\n");
-                        }
+                        guard_clone.lock().await.end_thinking();
                     }
                     AgentEvent::ToolCallStart { tool, arguments, .. } => {
                         let args_preview = arguments.to_string();
@@ -372,9 +398,7 @@ impl CrowCli {
                             args_preview
                         };
                         println!("\n\x1b[33m▶ {}: {}\x1b[0m", tool, args_short);
-                        // Accumulate tool call for external session
-                        let mut acc = accumulated_clone.lock().await;
-                        acc.push_str(&format!("\n[Tool: {} {}]\n", tool, args_short));
+                        guard_clone.lock().await.push_tool_call(tool, &args_short);
                     }
                     AgentEvent::ToolCallEnd {
                         tool,
@@ -394,12 +418,10 @@ impl CrowCli {
                             .log_tool_call(tool, arguments, result, *duration_ms)
                             .await;
 
-                        // Print to console
+                        // Print to console and accumulate
                         if *is_error {
                             println!("\x1b[31m✗ {} ({}ms): {}\x1b[0m", tool, duration_ms, output);
-                            // Accumulate error for external session
-                            let mut acc = accumulated_clone.lock().await;
-                            acc.push_str(&format!("[Tool Error: {}]\n", output));
+                            guard_clone.lock().await.push_tool_error(output);
                         } else {
                             let preview = if output.len() > 100 {
                                 format!("{}...", &output[..100])
@@ -407,13 +429,13 @@ impl CrowCli {
                                 output.clone()
                             };
                             println!("\x1b[32m✓ {} ({}ms): {}\x1b[0m", tool, duration_ms, preview);
-                            // Accumulate result for external session
-                            let mut acc = accumulated_clone.lock().await;
-                            acc.push_str(&format!("[Tool Result: {}]\n", preview));
+                            guard_clone.lock().await.push_tool_result(&preview);
                         }
                     }
                     AgentEvent::TurnComplete { .. } => {
                         println!();
+                        // Flush to DB periodically (every turn)
+                        guard_clone.lock().await.flush();
                     }
                     AgentEvent::Usage {
                         input_tokens,
@@ -433,19 +455,16 @@ impl CrowCli {
                     }
                     AgentEvent::CoagentStart { primary, coagent } => {
                         println!("\x1b[35m⟳ Coagent {} reviewing {}...\x1b[0m", coagent, primary);
-                        let mut acc = accumulated_clone.lock().await;
-                        acc.push_str(&format!("\n[Coagent {} reviewing {}]\n", coagent, primary));
+                        guard_clone.lock().await.push_coagent_start(coagent, primary);
                     }
                     AgentEvent::CoagentEnd { coagent, .. } => {
                         println!("\x1b[35m✓ Coagent {} done\x1b[0m", coagent);
-                        let mut acc = accumulated_clone.lock().await;
-                        acc.push_str(&format!("[Coagent {} done]\n", coagent));
+                        guard_clone.lock().await.push_coagent_end(coagent);
                     }
                     AgentEvent::Error { error, .. } => {
                         eprintln!("\x1b[31mError: {}\x1b[0m", error);
                         telemetry.log_error("agent", error).await;
-                        let mut acc = accumulated_clone.lock().await;
-                        acc.push_str(&format!("[Error: {}]\n", error));
+                        guard_clone.lock().await.push_error(error);
                     }
                     _ => {}
                 }
@@ -456,10 +475,13 @@ impl CrowCli {
         // tx was moved into agent.run, so when it returns the channel closes
         let (result, _) = tokio::join!(agent_fut, event_fut);
 
-        // Extract accumulated output
-        let output = accumulated.lock().await.clone();
+        // Clear global guard and explicitly complete (saves to DB)
+        clear_global_guard();
+        if let Ok(g) = Arc::try_unwrap(guard) {
+            g.into_inner().complete();
+        }
 
-        Ok((result, output))
+        Ok(result)
     }
 
     /// Load messages from a previous session to continue it
@@ -572,17 +594,9 @@ impl CrowCli {
         );
 
         let cancellation = get_shutdown_token();
-        let start = std::time::Instant::now();
 
-        let (result, accumulated_output) = self.run_agent(&mut messages, cancellation).await?;
-        let duration = start.elapsed().as_millis() as u64;
-
-        // Log the full accumulated output as the external session's assistant message
-        if !accumulated_output.is_empty() {
-            self.telemetry
-                .log_response(&accumulated_output, None, duration, Some(&self.model), None)
-                .await;
-        }
+        // InteractionGuard handles logging (saves on drop, survives cancellation)
+        let result = self.run_agent(&mut messages, cancellation).await?;
 
         match result {
             RunResult::Complete { summary, total_turns } => {
@@ -683,18 +697,10 @@ impl CrowCli {
                     );
 
                     let cancellation = get_shutdown_token();
-                    let start = std::time::Instant::now();
 
+                    // InteractionGuard handles logging (saves on drop, survives cancellation)
                     match self.run_agent(&mut messages, cancellation).await {
-                        Ok((result, accumulated_output)) => {
-                            // Log the full accumulated output as the external session's assistant message
-                            let duration = start.elapsed().as_millis() as u64;
-                            if !accumulated_output.is_empty() {
-                                self.telemetry
-                                    .log_response(&accumulated_output, None, duration, Some(&self.model), None)
-                                    .await;
-                            }
-
+                        Ok(result) => {
                             match result {
                                 RunResult::Complete { summary, .. } => {
                                     println!("\x1b[36m✓ {}\x1b[0m", summary);
@@ -1254,7 +1260,22 @@ async fn main() -> Result<()> {
     // Set up signal handling for graceful shutdown
     let shutdown = get_shutdown_token();
     tokio::spawn(async move {
-        let _ = tokio::signal::ctrl_c().await;
+        use tokio::signal::unix::{signal, SignalKind};
+
+        let mut sigint = signal(SignalKind::interrupt()).expect("SIGINT handler");
+        let mut sigterm = signal(SignalKind::terminate()).expect("SIGTERM handler");
+
+        tokio::select! {
+            _ = sigint.recv() => {
+                eprintln!("\n[SIGINT received, cancelling...]");
+            }
+            _ = sigterm.recv() => {
+                eprintln!("\n[SIGTERM received, cancelling...]");
+            }
+        }
+
+        // Flush any pending interaction data before shutdown
+        flush_global_guard();
         shutdown.cancel();
     });
 

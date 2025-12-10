@@ -65,7 +65,7 @@ pub use acp::run_stdio_server;
 pub use agent_old::CrowAgent; // Keep old export for now
 pub use auth::AuthConfig;
 pub use config::Config;
-pub use telemetry::{Telemetry, TraceGuard};
+pub use telemetry::{InteractionGuard, Telemetry, TraceGuard};
 
 // New exports
 pub use agent::{Agent, AgentConfig, BaseAgent, ControlFlow};
