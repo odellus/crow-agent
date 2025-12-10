@@ -5,7 +5,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crow_agent::{
-    agent::{AgentConfig, BaseAgent},
+    agent::{build_system_prompt, AgentConfig, AgentRegistry, BaseAgent},
     events::{AgentEvent, TurnCompleteReason},
     provider::{ProviderClient, ProviderConfig},
     tools2, Telemetry,
@@ -58,6 +58,14 @@ struct Cli {
     /// Verbose output (show thinking, usage)
     #[arg(short, long)]
     verbose: bool,
+
+    /// Agent type to use (default: build)
+    #[arg(short, long, default_value = "build")]
+    agent: String,
+
+    /// List available agents
+    #[arg(long)]
+    list_agents: bool,
 }
 
 #[derive(Subcommand)]
@@ -69,6 +77,10 @@ enum Commands {
     Prompt {
         /// The prompt to send to the agent
         message: String,
+
+        /// Continue an existing session instead of creating a new one
+        #[arg(short, long)]
+        session: Option<String>,
     },
 
     /// Show session statistics
@@ -125,7 +137,8 @@ enum Commands {
 
 struct CrowCli {
     agent: BaseAgent,
-    registry: crow_agent::tool::ToolRegistry,
+    agent_config: AgentConfig,
+    tool_registry: crow_agent::tool::ToolRegistry,
     tools: Vec<async_openai::types::ChatCompletionTool>,
     telemetry: Arc<Telemetry>,
     verbose: bool,
@@ -134,37 +147,78 @@ struct CrowCli {
 }
 
 impl CrowCli {
-    fn new(
+    async fn new(
         provider: Arc<ProviderClient>,
         working_dir: PathBuf,
         telemetry: Arc<Telemetry>,
         verbose: bool,
         data_dir: PathBuf,
         model: String,
-    ) -> Self {
-        let config = AgentConfig::new("crow");
-        let agent = BaseAgent::with_telemetry(config, provider, working_dir.clone(), telemetry.clone());
-        let registry = tools2::create_registry(working_dir);
-        let tools = registry.to_openai_tools();
+        agent_name: &str,
+    ) -> Result<Self> {
+        // Load agent registry
+        let agent_registry = AgentRegistry::new_with_config(&working_dir).await;
 
-        Self {
+        // Get agent config (or fall back to a default)
+        let agent_config = match agent_registry.get(agent_name).await {
+            Some(config) => config,
+            None => {
+                // If agent not found, show available agents
+                let available = agent_registry.list_ids().await;
+                anyhow::bail!(
+                    "Unknown agent '{}'. Available agents: {}",
+                    agent_name,
+                    available.join(", ")
+                );
+            }
+        };
+
+        // Create the base agent
+        let agent = BaseAgent::with_telemetry(
+            agent_config.clone(),
+            provider.clone(),
+            working_dir.clone(),
+            telemetry.clone(),
+        );
+
+        // Create tool registry with task tool for subagent spawning
+        let todo_store = tools2::TodoStore::new();
+        let session_id = telemetry.session_id().to_string();
+        let tool_registry = tools2::create_full_registry_async(
+            working_dir,
+            session_id,
+            todo_store,
+            agent_registry,
+            provider,
+        )
+        .await;
+
+        // Filter tools based on agent permissions
+        let tools: Vec<_> = tool_registry
+            .to_openai_tools()
+            .into_iter()
+            .filter(|t| agent_config.is_tool_enabled(&t.function.name))
+            .collect();
+
+        Ok(Self {
             agent,
-            registry,
+            agent_config,
+            tool_registry,
             tools,
             telemetry,
             verbose,
             data_dir,
             model,
-        }
+        })
     }
 
     fn system_prompt(&self) -> String {
-        r#"You are Crow, a helpful software engineering assistant.
+        // Use agent's custom prompt if available, otherwise use model-based prompt
+        let custom_prompt = self.agent_config.system_prompt.as_deref();
+        let model_id = self.model.as_str();
+        let working_dir = self.agent.working_dir();
 
-You have access to tools to help accomplish tasks. When you're done with a task, call task_complete with a summary.
-
-Be concise and direct. Focus on solving the user's problem efficiently."#
-            .to_string()
+        build_system_prompt(model_id, working_dir, custom_prompt)
     }
 
     async fn run_turn(
@@ -175,7 +229,7 @@ Be concise and direct. Focus on solving the user's problem efficiently."#
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let tools = self.tools.clone();
-        let registry = self.registry.clone();
+        let registry = self.tool_registry.clone();
         let verbose = self.verbose;
         let telemetry = self.telemetry.clone();
 
@@ -688,7 +742,7 @@ async fn replay_session(telemetry: &Telemetry, session_prefix: &str, _continue_s
     Ok(())
 }
 
-fn show_traces(telemetry: &Telemetry, limit: usize) -> Result<()> {
+fn show_traces(telemetry: &Telemetry, limit: usize, json: bool) -> Result<()> {
     use rusqlite::Connection;
 
     let conn = Connection::open(telemetry.db_path())?;
@@ -701,9 +755,6 @@ fn show_traces(telemetry: &Telemetry, limit: usize) -> Result<()> {
         limit
     ))?;
 
-    println!("Recent Traces:");
-    println!("{:-<100}", "");
-
     let rows = stmt.query_map([], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -714,6 +765,25 @@ fn show_traces(telemetry: &Telemetry, limit: usize) -> Result<()> {
             row.get::<_, Option<String>>(5)?,
         ))
     })?;
+
+    if json {
+        let mut traces = Vec::new();
+        for row in rows {
+            let (id, session_id, started_at, latency_ms, model, _preview) = row?;
+            traces.push(serde_json::json!({
+                "id": id,
+                "session_id": session_id,
+                "started_at": started_at,
+                "latency_ms": latency_ms,
+                "model_id": model,
+            }));
+        }
+        println!("{}", serde_json::to_string_pretty(&traces)?);
+        return Ok(());
+    }
+
+    println!("Recent Traces:");
+    println!("{:-<100}", "");
 
     for row in rows {
         let (id, session_id, started_at, latency_ms, model, preview) = row?;
@@ -739,6 +809,165 @@ fn show_traces(telemetry: &Telemetry, limit: usize) -> Result<()> {
             preview
         );
     }
+    Ok(())
+}
+
+fn show_trace(telemetry: &Telemetry, id_prefix: &str, full: bool, json: bool) -> Result<()> {
+    use rusqlite::Connection;
+
+    let conn = Connection::open(telemetry.db_path())?;
+
+    // Find trace matching prefix
+    let row: (String, String, String, Option<String>, String, String, String, Option<String>, Option<String>, Option<String>, Option<i64>, Option<i64>, Option<i64>, Option<i64>, Option<String>, Option<String>) = conn.query_row(
+        r#"SELECT id, session_id, started_at, completed_at, model_provider, model_id,
+                  request_messages, request_tools, response_content, response_tool_calls,
+                  input_tokens, output_tokens, total_tokens, latency_ms, error, agent_name
+           FROM traces
+           WHERE id LIKE ?1
+           ORDER BY started_at DESC
+           LIMIT 1"#,
+        [format!("{}%", id_prefix)],
+        |row| Ok((
+            row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?,
+            row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?,
+            row.get(8)?, row.get(9)?, row.get(10)?, row.get(11)?,
+            row.get(12)?, row.get(13)?, row.get(14)?, row.get(15)?,
+        )),
+    ).map_err(|_| anyhow::anyhow!("Trace not found: {}", id_prefix))?;
+
+    let (id, session_id, started_at, completed_at, model_provider, model_id,
+         request_messages, request_tools, response_content, response_tool_calls,
+         input_tokens, output_tokens, total_tokens, latency_ms, error, agent_name) = row;
+
+    if json {
+        let trace = serde_json::json!({
+            "id": id,
+            "session_id": session_id,
+            "agent_name": agent_name,
+            "started_at": started_at,
+            "completed_at": completed_at,
+            "model_provider": model_provider,
+            "model_id": model_id,
+            "request_messages": serde_json::from_str::<serde_json::Value>(&request_messages).unwrap_or(serde_json::Value::Null),
+            "request_tools": request_tools.as_ref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()),
+            "response_content": response_content,
+            "response_tool_calls": response_tool_calls.as_ref().and_then(|t| serde_json::from_str::<serde_json::Value>(t).ok()),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "latency_ms": latency_ms,
+            "error": error,
+        });
+        println!("{}", serde_json::to_string_pretty(&trace)?);
+        return Ok(());
+    }
+
+    // Pretty print
+    println!("Trace Details");
+    println!("{:─<80}", "");
+    println!("ID: {}", id);
+    println!("Session ID: {}", session_id);
+    println!("Agent: {}", agent_name.unwrap_or_else(|| "unknown".to_string()));
+    println!("Model: {}/{}", model_provider, model_id);
+    println!("Started: {}", started_at);
+    if let Some(ref completed) = completed_at {
+        println!("Completed: {}", completed);
+    }
+    if let Some(ms) = latency_ms {
+        println!("Latency: {}ms", ms);
+    }
+    println!();
+
+    // Token usage
+    println!("Token Usage");
+    println!("{:─<40}", "");
+    println!("  Input:  {}", input_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()));
+    println!("  Output: {}", output_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()));
+    println!("  Total:  {}", total_tokens.map(|t| t.to_string()).unwrap_or_else(|| "-".to_string()));
+    println!();
+
+    // Request messages
+    println!("Request Messages");
+    println!("{:─<80}", "");
+    if let Ok(messages) = serde_json::from_str::<Vec<serde_json::Value>>(&request_messages) {
+        for msg in &messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+            let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+            let display = if full || content.len() <= 500 {
+                content.to_string()
+            } else {
+                format!("{}...\n({} chars total, use --full to see all)", &content[..500], content.len())
+            };
+            println!("[{}]: {}", role, display);
+            println!();
+        }
+    } else {
+        println!("{}", request_messages);
+    }
+
+    // Request tools
+    if let Some(ref tools) = request_tools {
+        println!("Request Tools");
+        println!("{:─<80}", "");
+        if let Ok(tools_arr) = serde_json::from_str::<Vec<serde_json::Value>>(tools) {
+            let tool_names: Vec<String> = tools_arr.iter()
+                .filter_map(|t| t.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()))
+                .map(|s| s.to_string())
+                .collect();
+            println!("{} tools: {}", tool_names.len(), tool_names.join(", "));
+            if full {
+                println!();
+                println!("{}", serde_json::to_string_pretty(&tools_arr)?);
+            } else {
+                println!("(use --full to see tool schemas)");
+            }
+        } else {
+            println!("{}", tools);
+        }
+        println!();
+    }
+
+    // Response content
+    println!("Response Content");
+    println!("{:─<80}", "");
+    if let Some(ref content) = response_content {
+        let display = if full || content.len() <= 1000 {
+            content.clone()
+        } else {
+            format!("{}...\n({} chars total, use --full to see all)", &content[..1000], content.len())
+        };
+        println!("{}", display);
+    } else {
+        println!("(no content)");
+    }
+    println!();
+
+    // Response tool calls
+    if let Some(ref tool_calls) = response_tool_calls {
+        println!("Response Tool Calls");
+        println!("{:─<80}", "");
+        if let Ok(calls) = serde_json::from_str::<Vec<serde_json::Value>>(tool_calls) {
+            for call in &calls {
+                let name = call.get("name").and_then(|n| n.as_str()).unwrap_or("?");
+                let args = call.get("arguments").and_then(|a| a.as_str()).unwrap_or("{}");
+                println!("  {} {}", name, if full { args.to_string() } else {
+                    if args.len() > 100 { format!("{}...", &args[..100]) } else { args.to_string() }
+                });
+            }
+        } else {
+            println!("{}", tool_calls);
+        }
+        println!();
+    }
+
+    // Error
+    if let Some(ref err) = error {
+        println!("Error");
+        println!("{:─<80}", "");
+        println!("\x1b[31m{}\x1b[0m", err);
+        println!();
+    }
+
     Ok(())
 }
 
@@ -785,8 +1014,11 @@ async fn main() -> Result<()> {
         Some(Commands::Query { sql }) => {
             return run_query(&telemetry, sql);
         }
-        Some(Commands::Traces { limit }) => {
-            return show_traces(&telemetry, *limit);
+        Some(Commands::Traces { limit, json }) => {
+            return show_traces(&telemetry, *limit, *json);
+        }
+        Some(Commands::Trace { id, full, json }) => {
+            return show_trace(&telemetry, id, *full, *json);
         }
         Some(Commands::Replay { session, continue_session }) => {
             return replay_session(&telemetry, session, *continue_session).await;
@@ -794,17 +1026,47 @@ async fn main() -> Result<()> {
         _ => {}
     }
 
+    // Handle --list-agents
+    if cli.list_agents {
+        let agent_registry = AgentRegistry::new_with_config(&working_dir).await;
+        println!("Available Agents:");
+        println!("{:-<60}", "");
+
+        let mut agents = agent_registry.get_all().await;
+        agents.sort_by(|a, b| a.name.cmp(&b.name));
+
+        for agent in agents {
+            let mode = match agent.mode {
+                crow_agent::agent::AgentMode::Primary => "primary",
+                crow_agent::agent::AgentMode::Subagent => "subagent",
+                crow_agent::agent::AgentMode::All => "all",
+            };
+            let builtin = if agent.built_in { " (built-in)" } else { "" };
+            let desc = agent
+                .description
+                .as_deref()
+                .unwrap_or("No description");
+
+            println!(
+                "  {:12} [{:8}]{} - {}",
+                agent.name, mode, builtin, desc
+            );
+        }
+        return Ok(());
+    }
+
     // Build provider for agent commands
     let provider = build_provider(&cli)?;
 
     if cli.verbose {
         println!("Provider: {} ({})", cli.provider, cli.model);
+        println!("Agent: {}", cli.agent);
         println!("Session: {}", telemetry.session_id());
         println!("Database: {}", telemetry.db_path().display());
         println!();
     }
 
-    // Create CLI
+    // Create CLI with selected agent
     let crow = CrowCli::new(
         provider,
         working_dir,
@@ -812,10 +1074,13 @@ async fn main() -> Result<()> {
         cli.verbose,
         data_dir,
         cli.model.clone(),
-    );
+        &cli.agent,
+    )
+    .await?;
 
     match cli.command {
-        Some(Commands::Prompt { message }) => {
+        Some(Commands::Prompt { message, session: _ }) => {
+            // TODO: implement session continuation
             crow.chat(&message).await?;
         }
         Some(Commands::Repl) | None => {

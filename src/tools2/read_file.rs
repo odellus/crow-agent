@@ -1,4 +1,5 @@
-//! Read file tool
+//! Read file tool - reads file contents with line numbering
+//! Mirrors OpenCode's read tool
 
 use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
@@ -6,16 +7,19 @@ use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
 
-const DEFAULT_MAX_LINES: usize = 2000;
+const DEFAULT_LINE_LIMIT: usize = 2000;
+const MAX_LINE_LENGTH: usize = 2000;
 const BINARY_CHECK_SIZE: usize = 8192;
 
 #[derive(Debug, Deserialize)]
 struct Args {
+    /// File path - supports both filePath (OpenCode style) and path
+    #[serde(alias = "filePath")]
     path: String,
-    #[serde(default)]
-    start_line: Option<u32>,
-    #[serde(default)]
-    end_line: Option<u32>,
+    /// Line offset (1-indexed) - supports both offset and start_line
+    #[serde(default, alias = "start_line")]
+    offset: Option<usize>,
+    /// Maximum lines to read
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -75,29 +79,35 @@ impl Tool for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read the contents of a file. Use start_line/end_line for large files."
-                .to_string(),
+            description: r#"Reads a file from the local filesystem. You can access any file directly by using this tool.
+Assume this tool is able to read all files on the machine. If the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.
+
+Usage:
+- The filePath parameter must be an absolute path, not a relative path
+- By default, it reads up to 2000 lines starting from the beginning of the file
+- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters
+- Any lines longer than 2000 characters will be truncated
+- Results are returned using cat -n format, with line numbers starting at 1
+- You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.
+- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.
+- You can read image files using this tool."#.to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": {
+                    "filePath": {
                         "type": "string",
-                        "description": "Path to the file (relative to project root)"
+                        "description": "The path to the file to read"
                     },
-                    "start_line": {
+                    "offset": {
                         "type": "integer",
-                        "description": "Line number to start reading from (1-indexed)"
-                    },
-                    "end_line": {
-                        "type": "integer",
-                        "description": "Line number to stop reading at (1-indexed, inclusive)"
+                        "description": "Line number to start reading from (1-indexed, optional)"
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of lines to return (default: 2000)"
+                        "description": "Maximum number of lines to read (optional, default 2000)"
                     }
                 },
-                "required": ["path"]
+                "required": ["filePath"]
             }),
         }
     }
@@ -130,84 +140,37 @@ impl Tool for ReadFileTool {
             Err(e) => return ToolResult::error(format!("Failed to read file: {}", e)),
         };
 
-        let lines: Vec<&str> = content.lines().collect();
-        let total_lines = lines.len();
-        let max_lines = args.limit.unwrap_or(DEFAULT_MAX_LINES);
+        // Check for empty file
+        if content.is_empty() {
+            return ToolResult::success("Warning: File exists but has empty contents".to_string());
+        }
 
-        let output = match (args.start_line, args.end_line) {
-            (Some(start), Some(end)) => {
-                let start = start.max(1) as usize;
-                let end = end.max(start as u32) as usize;
-                let selected: Vec<&str> = lines
-                    .iter()
-                    .skip(start - 1)
-                    .take(end - start + 1)
-                    .copied()
-                    .collect();
-                format!(
-                    "# {} (lines {}-{} of {})\n\n{}",
-                    args.path,
-                    start,
-                    end.min(total_lines),
-                    total_lines,
-                    selected.join("\n")
-                )
-            }
-            (Some(start), None) => {
-                let start = start.max(1) as usize;
-                let selected: Vec<&str> = lines
-                    .iter()
-                    .skip(start - 1)
-                    .take(max_lines)
-                    .copied()
-                    .collect();
-                let actual_end = (start - 1 + selected.len()).min(total_lines);
-                let truncated = total_lines > start - 1 + max_lines;
-                let mut out = format!(
-                    "# {} (lines {}-{} of {})\n\n{}",
-                    args.path,
-                    start,
-                    actual_end,
-                    total_lines,
-                    selected.join("\n")
-                );
-                if truncated {
-                    out.push_str(&format!(
-                        "\n\n... truncated ({} more lines)",
-                        total_lines - actual_end
-                    ));
-                }
-                out
-            }
-            (None, Some(end)) => {
-                let end = end.max(1) as usize;
-                let selected: Vec<&str> = lines.iter().take(end).copied().collect();
-                format!(
-                    "# {} (lines 1-{} of {})\n\n{}",
-                    args.path,
-                    end.min(total_lines),
-                    total_lines,
-                    selected.join("\n")
-                )
-            }
-            (None, None) => {
-                let truncated = total_lines > max_lines;
-                let selected: Vec<&str> = lines.iter().take(max_lines).copied().collect();
-                let mut out = format!(
-                    "# {} ({} lines)\n\n{}",
-                    args.path,
-                    total_lines,
-                    selected.join("\n")
-                );
-                if truncated {
-                    out.push_str(&format!(
-                        "\n\n... truncated ({} more lines)",
-                        total_lines - max_lines
-                    ));
-                }
-                out
-            }
-        };
+        let all_lines: Vec<&str> = content.lines().collect();
+        let total_lines = all_lines.len();
+
+        // Apply offset and limit (offset is 1-indexed)
+        let offset = args.offset.unwrap_or(1).saturating_sub(1); // Convert to 0-indexed
+        let limit = args.limit.unwrap_or(DEFAULT_LINE_LIMIT);
+
+        // Format output like cat -n (line numbers with content)
+        let lines_to_show: Vec<String> = all_lines
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .enumerate()
+            .map(|(idx, line)| {
+                let line_number = offset + idx + 1; // Convert back to 1-indexed
+                // Truncate long lines
+                let truncated_line = if line.len() > MAX_LINE_LENGTH {
+                    &line[..MAX_LINE_LENGTH]
+                } else {
+                    line
+                };
+                format!("{:6}\t{}", line_number, truncated_line)
+            })
+            .collect();
+
+        let output = lines_to_show.join("\n");
 
         ToolResult::success(output)
     }
