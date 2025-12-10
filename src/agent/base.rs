@@ -6,7 +6,7 @@
 //! 3. Repeat until: text response, task_complete, or cancelled
 //!
 //! It knows NOTHING about control flow, coagents, or orchestration.
-//! That's the job of ACPAgent in control_flow.rs.
+//! That's the job of Agent in control_flow.rs.
 
 use crate::agent::AgentConfig;
 use crate::events::{AgentEvent, ExecutedToolCall, TokenUsage, TurnCompleteReason, TurnResult};

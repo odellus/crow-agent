@@ -141,3 +141,48 @@ pub async fn create_full_registry_async(
 
     registry
 }
+
+/// Create a coagent tool registry with shared TodoStore
+///
+/// Coagent gets:
+/// - Read-only tools (grep, find, list_directory, read_file)
+/// - Todo tools (SHARED with primary via same TodoStore)
+/// - task_complete (to signal when done)
+/// - NO task tool (coagent shouldn't spawn sub-subagents)
+/// - NO edit/bash by default (can be enabled via config)
+///
+/// The TodoStore should already have share_sessions() called to link
+/// primary_session_id and coagent_session_id.
+pub fn create_coagent_registry(
+    working_dir: PathBuf,
+    coagent_session_id: String,
+    todo_store: TodoStore,
+    read_only: bool,
+) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+
+    // Read-only tools (always available)
+    registry.register(ReadFileTool::new(working_dir.clone()));
+    registry.register(GrepTool::new(working_dir.clone()));
+    registry.register(FindPathTool::new(working_dir.clone()));
+    registry.register(ListDirectoryTool::new(working_dir.clone()));
+
+    // Web tools (read-only)
+    registry.register(FetchTool::new());
+    registry.register(WebSearchTool::new());
+
+    // Todo tools - SHARED with primary
+    registry.register(TodoWriteTool::new(todo_store.clone(), coagent_session_id.clone()));
+    registry.register(TodoReadTool::new(todo_store, coagent_session_id));
+
+    // Task complete - coagent can signal completion
+    registry.register(TaskCompleteTool::new());
+
+    // Write tools only if not read-only mode
+    if !read_only {
+        registry.register(EditTool::new(working_dir.clone()));
+        registry.register(BashTool::new());
+    }
+
+    registry
+}

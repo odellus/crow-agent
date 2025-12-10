@@ -11,7 +11,7 @@ use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 use std::path::PathBuf;
 
@@ -162,6 +162,42 @@ The tool uses fuzzy matching to handle minor whitespace/indentation differences 
                 "required": ["filePath", "oldString", "newString"]
             }),
         }
+    }
+
+    /// Humanize: path + old/new snippets (first 30 lines each)
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let path = args.get("filePath")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())?;
+
+        if result.is_error {
+            return Some(format!("edit {} → err: {}", path, result.output));
+        }
+
+        let old = args.get("oldString")
+            .or_else(|| args.get("old_string"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let new = args.get("newString")
+            .or_else(|| args.get("new_string"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let truncate = |s: &str| -> String {
+            let lines: Vec<&str> = s.lines().collect();
+            if lines.len() <= 30 {
+                s.to_string()
+            } else {
+                format!("{}\n... ({} more lines)", lines[..30].join("\n"), lines.len() - 30)
+            }
+        };
+
+        Some(format!(
+            "edit {}\n--- old:\n{}\n+++ new:\n{}",
+            path,
+            truncate(old),
+            truncate(new)
+        ))
     }
 
     async fn execute(&self, args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {

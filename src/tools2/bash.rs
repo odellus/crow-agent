@@ -5,7 +5,7 @@
 use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::process::Stdio;
 use tokio::process::Command;
 
@@ -124,6 +124,24 @@ IMPORTANT: When the user asks you to create a pull request, follow these steps c
                 "required": ["command", "description"]
             }),
         }
+    }
+
+    /// Humanize: command + first ~30 lines of output
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let cmd = args.get("command").and_then(|v| v.as_str())?;
+
+        let status = if result.is_error { "err" } else { "ok" };
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more lines)", first_30, total - 30)
+        };
+
+        Some(format!("$ {}\n[{}]\n{}", cmd, status, preview))
     }
 
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {

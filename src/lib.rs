@@ -68,6 +68,6 @@ pub use config::Config;
 pub use telemetry::{Telemetry, TraceGuard};
 
 // New exports
-pub use agent::{ACPAgent, AgentConfig, BaseAgent, ControlFlow};
+pub use agent::{Agent, AgentConfig, BaseAgent, ControlFlow};
 pub use events::{AgentEvent, AgentEventStream, TurnResult};
 pub use provider::{ProviderClient, ProviderConfig, StreamDelta};

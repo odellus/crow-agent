@@ -4,7 +4,7 @@
 use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 
 const DEFAULT_LINE_LIMIT: usize = 2000;
@@ -112,6 +112,29 @@ Usage:
         }
     }
 
+    /// Humanize: path + first ~30 lines of content
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let path = args.get("filePath")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())?;
+
+        if result.is_error {
+            return Some(format!("read {} → err: {}", path, result.output));
+        }
+
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more lines)", first_30, total - 30)
+        };
+
+        Some(format!("read {}\n{}", path, preview))
+    }
+
     async fn execute(&self, args: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         let args: Args = match serde_json::from_value(args) {
             Ok(a) => a,
@@ -146,7 +169,7 @@ Usage:
         }
 
         let all_lines: Vec<&str> = content.lines().collect();
-        let total_lines = all_lines.len();
+        let _total_lines = all_lines.len();
 
         // Apply offset and limit (offset is 1-indexed)
         let offset = args.offset.unwrap_or(1).saturating_sub(1); // Convert to 0-indexed

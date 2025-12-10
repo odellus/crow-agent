@@ -3,7 +3,7 @@
 use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -46,6 +46,12 @@ impl Tool for TaskCompleteTool {
                 "required": ["summary"]
             }),
         }
+    }
+
+    /// Humanize: just the summary (this is the terminal action)
+    fn humanize(&self, args: &Value, _result: &ToolResult) -> Option<String> {
+        let summary = args.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+        Some(format!("✓ completed: {}", summary))
     }
 
     async fn execute(&self, args: serde_json::Value, _ctx: &ToolContext) -> ToolResult {

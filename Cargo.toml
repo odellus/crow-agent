@@ -78,8 +78,8 @@ serde_yaml = "0.9.34"
 tempfile = "3.10"
 
 [[bin]]
-name = "crow-agent-dev"
-path = "src/bin/crow-agent-dev.rs"
+name = "crow-agent"
+path = "src/bin/crow-agent.rs"
 
 [[bin]]
 name = "test_new_agent"

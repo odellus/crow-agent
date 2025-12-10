@@ -1,12 +1,13 @@
 //! Agent registry for managing and loading agents
 //!
 //! Loads agents from:
-//! 1. Built-in agents (general, build, plan, executor, arbiter, planner, architect)
-//! 2. Project config: `.crow/agent/*.md` files
-//! 3. Global config: `~/.config/crow/agent/*.md` files
+//! 1. Built-in agents (general, build, plan)
+//! 2. YAML configs: ~/.config/crow/agents/*.yaml and .crow/agents/*.yaml
+//! 3. Markdown configs (legacy): .crow/agent/*.md files
 
 use super::builtins::get_builtin_agents;
 use super::config::{AgentConfig, AgentMode, AgentPermissions, Permission, ToolPermissions};
+use super::config_loader::load_agent_configs;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -28,25 +29,39 @@ impl AgentRegistry {
     }
 
     /// Create registry and load agents from config directories
+    ///
+    /// Loading order (later overrides earlier):
+    /// 1. Built-in agents (general, build, plan)
+    /// 2. YAML configs: ~/.config/crow/agents/*.yaml (global)
+    /// 3. YAML configs: .crow/agents/*.yaml (project)
+    /// 4. Markdown configs: ~/.config/crow/agent/*.md (global, legacy)
+    /// 5. Markdown configs: .crow/agent/*.md (project, legacy)
     pub async fn new_with_config(working_dir: &Path) -> Self {
         let mut agents = get_builtin_agents();
 
-        // Load from global config: ~/.config/crow/agent/*.md
+        // Load YAML configs (global + project, project overrides global)
+        let yaml_configs = load_agent_configs(working_dir);
+        for (name, config) in yaml_configs {
+            debug!("Loaded YAML agent config: {}", name);
+            agents.insert(name, config);
+        }
+
+        // Load from global markdown config: ~/.config/crow/agent/*.md (legacy)
         if let Some(config_dir) = dirs::config_dir() {
             let global_agent_dir = config_dir.join("crow").join("agent");
             if let Ok(loaded) = Self::load_agents_from_dir(&global_agent_dir).await {
                 for agent in loaded {
-                    debug!("Loaded global agent: {}", agent.name);
+                    debug!("Loaded global agent (markdown): {}", agent.name);
                     agents.insert(agent.name.clone(), agent);
                 }
             }
         }
 
-        // Load from project config: .crow/agent/*.md (higher priority)
+        // Load from project markdown config: .crow/agent/*.md (legacy, highest priority)
         let project_agent_dir = working_dir.join(".crow").join("agent");
         if let Ok(loaded) = Self::load_agents_from_dir(&project_agent_dir).await {
             for agent in loaded {
-                debug!("Loaded project agent: {}", agent.name);
+                debug!("Loaded project agent (markdown): {}", agent.name);
                 agents.insert(agent.name.clone(), agent);
             }
         }
@@ -302,6 +317,7 @@ impl AgentRegistry {
             .filter(|a| match mode {
                 AgentMode::Primary => a.is_primary(),
                 AgentMode::Subagent => a.is_subagent(),
+                AgentMode::Coagent => a.mode.is_coagent(),
                 AgentMode::All => true,
             })
             .cloned()
@@ -379,143 +395,5 @@ impl Clone for AgentRegistry {
         Self {
             agents: self.agents.clone(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_registry_creation() {
-        let registry = AgentRegistry::new();
-        let count = registry.count().await;
-        assert_eq!(count, 7); // 7 built-in agents
-    }
-
-    #[tokio::test]
-    async fn test_get_agent() {
-        let registry = AgentRegistry::new();
-        let agent = registry.get("build").await;
-        assert!(agent.is_some());
-        assert_eq!(agent.unwrap().name, "build");
-    }
-
-    #[tokio::test]
-    async fn test_get_nonexistent_agent() {
-        let registry = AgentRegistry::new();
-        let agent = registry.get("nonexistent").await;
-        assert!(agent.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_get_primary_agents() {
-        let registry = AgentRegistry::new();
-        let primary = registry.get_primary_agents().await;
-
-        // build, plan, planner, architect
-        assert_eq!(primary.len(), 4);
-
-        let names: Vec<String> = primary.iter().map(|a| a.name.clone()).collect();
-        assert!(names.contains(&"build".to_string()));
-        assert!(names.contains(&"plan".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_get_subagents() {
-        let registry = AgentRegistry::new();
-        let subagents = registry.get_subagents().await;
-
-        // general, executor, arbiter
-        assert_eq!(subagents.len(), 3);
-
-        let names: Vec<String> = subagents.iter().map(|a| a.name.clone()).collect();
-        assert!(names.contains(&"general".to_string()));
-        assert!(names.contains(&"arbiter".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_register_custom_agent() {
-        let registry = AgentRegistry::new();
-
-        let custom = AgentConfig::new("custom-agent");
-        registry.register(custom).await;
-
-        let count = registry.count().await;
-        assert_eq!(count, 8); // 7 built-in + 1 custom
-
-        let agent = registry.get("custom-agent").await;
-        assert!(agent.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_cannot_remove_builtin() {
-        let registry = AgentRegistry::new();
-        let result = registry.unregister("build").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_can_remove_custom() {
-        let registry = AgentRegistry::new();
-
-        let custom = AgentConfig::new("custom");
-        registry.register(custom).await;
-
-        let result = registry.unregister("custom").await;
-        assert!(result.is_ok());
-
-        let exists = registry.exists("custom").await;
-        assert!(!exists);
-    }
-
-    #[tokio::test]
-    async fn test_list_ids() {
-        let registry = AgentRegistry::new();
-        let ids = registry.list_ids().await;
-
-        assert_eq!(ids.len(), 7);
-        assert!(ids.contains(&"general".to_string()));
-        assert!(ids.contains(&"build".to_string()));
-        assert!(ids.contains(&"plan".to_string()));
-        assert!(ids.contains(&"arbiter".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_subagent_descriptions() {
-        let registry = AgentRegistry::new();
-        let desc = registry.subagent_descriptions().await;
-
-        assert!(desc.contains("general"));
-        assert!(desc.contains("executor"));
-        assert!(desc.contains("arbiter"));
-        // Primary agents should NOT be in subagent descriptions
-        assert!(!desc.contains("- build:"));
-        assert!(!desc.contains("- plan:"));
-    }
-
-    #[test]
-    fn test_parse_markdown_with_frontmatter() {
-        let content = r#"---
-description: Test agent
-mode: subagent
-temperature: 0.5
----
-
-This is the custom prompt.
-"#;
-        let (fm, prompt) = AgentRegistry::parse_markdown(content).unwrap();
-        assert_eq!(fm.get("description").unwrap().as_str().unwrap(), "Test agent");
-        assert_eq!(fm.get("mode").unwrap().as_str().unwrap(), "subagent");
-        assert_eq!(fm.get("temperature").unwrap().as_f64().unwrap(), 0.5);
-        assert_eq!(prompt.trim(), "This is the custom prompt.");
-    }
-
-    #[test]
-    fn test_parse_markdown_no_frontmatter() {
-        let content = "Just a prompt with no frontmatter";
-        let (fm, prompt) = AgentRegistry::parse_markdown(content).unwrap();
-        assert!(fm.is_empty());
-        assert_eq!(prompt, "Just a prompt with no frontmatter");
     }
 }

@@ -6,7 +6,7 @@ use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
 use regex::Regex;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use walkdir::WalkDir;
 
@@ -165,6 +165,27 @@ impl Tool for GrepTool {
         }
     }
 
+    /// Humanize: pattern + first 30 lines of matches
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let pattern = args.get("pattern").and_then(|v| v.as_str())?;
+
+        if result.is_error {
+            return Some(format!("grep \"{}\" → err: {}", pattern, result.output));
+        }
+
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more lines)", first_30, total - 30)
+        };
+
+        Some(format!("grep \"{}\"\n{}", pattern, preview))
+    }
+
     async fn execute(&self, args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         if ctx.is_cancelled() {
             return ToolResult::error("Cancelled");
@@ -190,7 +211,6 @@ impl Tool for GrepTool {
 
         // Collect matches: (path, line_num, line_text)
         let mut all_matches: Vec<(PathBuf, usize, String)> = Vec::new();
-        let mut files_searched = 0;
 
         let walker = if search_path.is_file() {
             WalkDir::new(&search_path).max_depth(0)
@@ -218,7 +238,6 @@ impl Tool for GrepTool {
                 Err(_) => continue,
             };
 
-            files_searched += 1;
             let lines: Vec<&str> = content.lines().collect();
 
             for (line_num, line) in lines.iter().enumerate() {

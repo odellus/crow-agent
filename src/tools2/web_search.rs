@@ -6,7 +6,7 @@ use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Debug, Deserialize)]
 struct Args {
@@ -102,6 +102,27 @@ Requires SEARXNG_URL environment variable (default: http://localhost:8082)"#.to_
         }
     }
 
+    /// Humanize: query + first 30 lines of results
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let query = args.get("query").and_then(|v| v.as_str())?;
+
+        if result.is_error {
+            return Some(format!("search \"{}\" → err: {}", query, result.output));
+        }
+
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more lines)", first_30, total - 30)
+        };
+
+        Some(format!("search \"{}\"\n{}", query, preview))
+    }
+
     async fn execute(&self, args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         if ctx.is_cancelled() {
             return ToolResult::error("Cancelled");
@@ -155,5 +176,22 @@ Requires SEARXNG_URL environment variable (default: http://localhost:8082)"#.to_
         }
 
         ToolResult::success(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_url() {
+        let search = WebSearchTool::new();
+        assert!(search.searxng_url.contains("localhost") || search.searxng_url.contains("8082"));
+    }
+
+    #[test]
+    fn test_custom_url() {
+        let search = WebSearchTool::with_url("http://example.com:9000");
+        assert_eq!(search.searxng_url, "http://example.com:9000");
     }
 }

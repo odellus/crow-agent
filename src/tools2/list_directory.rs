@@ -5,7 +5,7 @@
 use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::PathBuf;
 
 #[derive(Debug, Deserialize)]
@@ -143,6 +143,27 @@ impl Tool for ListDirectoryTool {
                 "required": ["path"]
             }),
         }
+    }
+
+    /// Humanize: path + first 30 entries
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+
+        if result.is_error {
+            return Some(format!("ls {} → err: {}", path, result.output));
+        }
+
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more entries)", first_30, total - 30)
+        };
+
+        Some(format!("ls {}\n{}", path, preview))
     }
 
     async fn execute(&self, args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {

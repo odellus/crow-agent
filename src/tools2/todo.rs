@@ -6,7 +6,7 @@ use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -175,6 +175,25 @@ impl Tool for TodoWriteTool {
         }
     }
 
+    /// Humanize: show the updated todo list
+    fn humanize(&self, _args: &Value, result: &ToolResult) -> Option<String> {
+        if result.is_error {
+            return Some(format!("todo_write → err: {}", result.output));
+        }
+
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more lines)", first_30, total - 30)
+        };
+
+        Some(format!("todo_write\n{}", preview))
+    }
+
     async fn execute(&self, args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {
         if ctx.is_cancelled() {
             return ToolResult::error("Cancelled");
@@ -237,6 +256,25 @@ impl Tool for TodoReadTool {
                 }
             }),
         }
+    }
+
+    /// Humanize: show current todo state
+    fn humanize(&self, _args: &Value, result: &ToolResult) -> Option<String> {
+        if result.is_error {
+            return Some(format!("todo_read → err: {}", result.output));
+        }
+
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more lines)", first_30, total - 30)
+        };
+
+        Some(format!("todo_read\n{}", preview))
     }
 
     async fn execute(&self, _args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {

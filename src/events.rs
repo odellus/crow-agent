@@ -75,7 +75,7 @@ pub enum AgentEvent {
         reason: TurnCompleteReason,
     },
 
-    // === Control Flow (emitted by ACPAgent, not BaseAgent) ===
+    // === Control Flow (emitted by Agent, not BaseAgent) ===
     /// Coagent starting
     CoagentStart {
         primary: String,

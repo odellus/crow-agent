@@ -7,6 +7,7 @@
 //! - Web fetch permissions
 //! - Doom loop detection override
 
+use crate::agent::ControlFlow;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -227,6 +228,8 @@ impl AgentPermissions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentConfig {
     /// Agent name (unique identifier)
+    /// When loading from YAML files, this is set from the filename.
+    #[serde(default)]
     pub name: String,
 
     /// Description of what this agent does
@@ -276,6 +279,47 @@ pub struct AgentConfig {
     /// Display color (hex)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color: Option<String>,
+
+    /// Control flow mode - what happens after each ReAct turn
+    /// - passthrough: Return to user after each turn (HITL)
+    /// - loop: Keep going until task_complete (default)
+    /// - static: Inject canned message between turns
+    /// - generated: Generate acceptance criteria once, inject each turn
+    /// - coagent: Dual-agent system with arbiter oversight
+    #[serde(default)]
+    pub control_flow: ControlFlowConfig,
+
+    /// Static message to inject between turns (for control_flow: static)
+    /// Can be inline string or path to prompt file
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_message: Option<String>,
+
+    /// Prompt for generating acceptance criteria (for control_flow: generated)
+    /// Can be inline string or path to prompt file
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generate_prompt: Option<String>,
+
+    /// Coagent config name (required when control_flow is coagent)
+    /// Specifies which coagent agent to use for oversight
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coagent: Option<String>,
+}
+
+/// Control flow configuration for YAML
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlFlowConfig {
+    /// Return to user after each turn (HITL)
+    Passthrough,
+    /// Keep going until task_complete
+    #[default]
+    Loop,
+    /// Inject canned message between turns
+    Static,
+    /// Generate acceptance criteria once, inject each turn
+    Generated,
+    /// Dual-agent with coagent oversight
+    Coagent,
 }
 
 fn default_max_iterations() -> Option<usize> {
@@ -299,6 +343,10 @@ impl AgentConfig {
             permissions: AgentPermissions::default(),
             built_in: false,
             color: None,
+            control_flow: ControlFlowConfig::Loop,
+            static_message: None,
+            generate_prompt: None,
+            coagent: None,
         }
     }
 
@@ -332,6 +380,34 @@ impl AgentConfig {
     /// Get effective top_p (with default fallback)
     pub fn get_top_p(&self) -> f32 {
         self.top_p.unwrap_or(1.0)
+    }
+
+    /// Get control flow for runtime
+    pub fn get_control_flow(&self) -> ControlFlow {
+        match self.control_flow {
+            ControlFlowConfig::Passthrough => ControlFlow::Passthrough,
+            ControlFlowConfig::Loop => ControlFlow::Loop,
+            ControlFlowConfig::Static => ControlFlow::Static {
+                message: self.static_message.clone()
+                    .unwrap_or_else(|| "Continue with the task. Call task_complete when done.".into()),
+            },
+            ControlFlowConfig::Generated => ControlFlow::Generated {
+                generator_prompt: self.generate_prompt.clone()
+                    .unwrap_or_else(|| "Based on the conversation so far, what are the acceptance criteria for this task? Be specific and concise.".into()),
+                acceptance_criteria: None,
+            },
+            ControlFlowConfig::Coagent => ControlFlow::Coagent,
+        }
+    }
+
+    /// Does this agent use a coagent?
+    pub fn has_coagent(&self) -> bool {
+        self.control_flow == ControlFlowConfig::Coagent
+    }
+
+    /// Get coagent name (defaults to "judge")
+    pub fn coagent_name(&self) -> &str {
+        self.coagent.as_deref().unwrap_or("judge")
     }
 
     /// Builder: set description
@@ -370,6 +446,18 @@ impl AgentConfig {
         self
     }
 
+    /// Builder: set control flow
+    pub fn with_control_flow(mut self, control_flow: ControlFlowConfig) -> Self {
+        self.control_flow = control_flow;
+        self
+    }
+
+    /// Builder: set coagent name
+    pub fn with_coagent(mut self, coagent: impl Into<String>) -> Self {
+        self.coagent = Some(coagent.into());
+        self
+    }
+
     /// Builder: set tool permissions
     pub fn with_tools(mut self, tools: ToolPermissions) -> Self {
         self.tools = tools;
@@ -398,6 +486,8 @@ pub enum AgentMode {
     Primary,
     /// Only usable as subagent (spawned by Task tool)
     Subagent,
+    /// Only usable as coagent (dual-agent orchestration, autonomy levels 3-5)
+    Coagent,
     /// Both primary and subagent
     All,
 }
@@ -409,6 +499,10 @@ impl AgentMode {
 
     pub fn is_subagent(&self) -> bool {
         matches!(self, AgentMode::Subagent | AgentMode::All)
+    }
+
+    pub fn is_coagent(&self) -> bool {
+        matches!(self, AgentMode::Coagent)
     }
 }
 

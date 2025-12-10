@@ -72,6 +72,55 @@ pub trait Tool: Send + Sync {
 
     /// Execute the tool with given arguments
     async fn execute(&self, args: Value, ctx: &ToolContext) -> ToolResult;
+
+    /// Humanize a tool call into a concise summary for coagent context.
+    ///
+    /// Takes the arguments and result, returns a short markdown summary.
+    /// Used to compress tool calls when passing context between agents.
+    ///
+    /// Default implementation uses tool name + truncated args.
+    /// Override for tool-specific formatting.
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let args_preview = summarize_args(args);
+        if result.is_error {
+            Some(format!("{} failed: {}", self.name(), truncate(&result.output, 100)))
+        } else {
+            Some(format!("{}({})", self.name(), args_preview))
+        }
+    }
+}
+
+/// Summarize args into a short string for humanization
+fn summarize_args(args: &Value) -> String {
+    match args {
+        Value::Object(map) => {
+            let parts: Vec<String> = map
+                .iter()
+                .take(2) // max 2 args shown
+                .map(|(k, v)| {
+                    let val = match v {
+                        Value::String(s) => truncate(s, 30),
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => "...".to_string(),
+                    };
+                    format!("{}={}", k, val)
+                })
+                .collect();
+            parts.join(", ")
+        }
+        _ => "...".to_string(),
+    }
+}
+
+/// Truncate a string with ellipsis
+fn truncate(s: &str, max: usize) -> String {
+    let s = s.trim();
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
 }
 
 /// Registry of available tools
@@ -133,6 +182,11 @@ impl ToolRegistry {
             Some(tool) => tool.execute(args, ctx).await,
             None => ToolResult::error(format!("Unknown tool: {}", name)),
         }
+    }
+
+    /// Humanize a tool call (delegates to the tool's humanize method)
+    pub fn humanize(&self, name: &str, args: &Value, result: &ToolResult) -> Option<String> {
+        self.get(name).and_then(|tool| tool.humanize(args, result))
     }
 }
 

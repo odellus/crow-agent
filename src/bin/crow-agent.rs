@@ -5,9 +5,11 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use crow_agent::{
-    agent::{build_system_prompt, AgentConfig, AgentRegistry, BaseAgent},
-    events::{AgentEvent, TurnCompleteReason},
+    agent::{build_system_prompt, Agent, AgentRegistry, RunResult},
+    config::Config,
+    events::AgentEvent,
     provider::{ProviderClient, ProviderConfig},
+    run_stdio_server,
     tools2, Telemetry,
 };
 use rustyline::error::ReadlineError;
@@ -73,6 +75,9 @@ enum Commands {
     /// Start an interactive REPL session
     Repl,
 
+    /// Run as ACP server over stdio (for editor integration)
+    Acp,
+
     /// Run a single prompt
     Prompt {
         /// The prompt to send to the agent
@@ -136,10 +141,13 @@ enum Commands {
 }
 
 struct CrowCli {
-    agent: BaseAgent,
-    agent_config: AgentConfig,
+    agent: Agent,
     tool_registry: crow_agent::tool::ToolRegistry,
     tools: Vec<async_openai::types::ChatCompletionTool>,
+    /// Coagent tool registry (if using coagent mode)
+    coagent_tool_registry: Option<crow_agent::tool::ToolRegistry>,
+    /// Coagent tools (if using coagent mode)
+    coagent_tools: Vec<async_openai::types::ChatCompletionTool>,
     telemetry: Arc<Telemetry>,
     verbose: bool,
     data_dir: PathBuf,
@@ -173,17 +181,74 @@ impl CrowCli {
             }
         };
 
-        // Create the base agent
-        let agent = BaseAgent::with_telemetry(
-            agent_config.clone(),
-            provider.clone(),
-            working_dir.clone(),
-            telemetry.clone(),
-        );
+        // Get control flow from agent config
+        let control_flow = agent_config.get_control_flow();
 
-        // Create tool registry with task tool for subagent spawning
+        // Create shared TodoStore
         let todo_store = tools2::TodoStore::new();
         let session_id = telemetry.session_id().to_string();
+
+        // Check if we need a coagent
+        let (agent, coagent_tool_registry, coagent_tools) = if agent_config.has_coagent() {
+            // Load coagent config
+            let coagent_name = agent_config.coagent_name();
+            let coagent_config = match agent_registry.get(coagent_name).await {
+                Some(config) => config,
+                None => {
+                    anyhow::bail!(
+                        "Coagent '{}' not found. Create {}.yaml in .crow/agents/ or ~/.config/crow/agents/",
+                        coagent_name,
+                        coagent_name
+                    );
+                }
+            };
+
+            // Generate unique coagent session ID
+            let coagent_session_id = format!("{}-coagent", session_id);
+
+            // Create agent with coagent and shared todos
+            let agent = Agent::with_coagent_and_telemetry(
+                agent_name,
+                agent_config.clone(),
+                coagent_config.clone(),
+                provider.clone(),
+                working_dir.clone(),
+                control_flow,
+                telemetry.clone(),
+            )
+            .with_shared_todos(todo_store.clone(), &session_id, &coagent_session_id);
+
+            // Create coagent tool registry with shared TodoStore
+            // Coagent gets read-only tools for now (permissions can be wired later)
+            let coagent_registry = tools2::create_coagent_registry(
+                working_dir.clone(),
+                coagent_session_id,
+                todo_store.clone(),
+                false,
+            );
+
+            // Filter coagent tools based on coagent config permissions
+            let coagent_tools: Vec<_> = coagent_registry
+                .to_openai_tools()
+                .into_iter()
+                .filter(|t| coagent_config.is_tool_enabled(&t.function.name))
+                .collect();
+
+            (agent, Some(coagent_registry), coagent_tools)
+        } else {
+            // No coagent - create simple agent
+            let agent = Agent::with_telemetry(
+                agent_name,
+                agent_config.clone(),
+                provider.clone(),
+                working_dir.clone(),
+                control_flow,
+                telemetry.clone(),
+            );
+            (agent, None, vec![])
+        };
+
+        // Create primary tool registry with task tool for subagent spawning
         let tool_registry = tools2::create_full_registry_async(
             working_dir,
             session_id,
@@ -202,9 +267,10 @@ impl CrowCli {
 
         Ok(Self {
             agent,
-            agent_config,
             tool_registry,
             tools,
+            coagent_tool_registry,
+            coagent_tools,
             telemetry,
             verbose,
             data_dir,
@@ -214,29 +280,55 @@ impl CrowCli {
 
     fn system_prompt(&self) -> String {
         // Use agent's custom prompt if available, otherwise use model-based prompt
-        let custom_prompt = self.agent_config.system_prompt.as_deref();
+        let custom_prompt = self.agent.config.system_prompt.as_deref();
         let model_id = self.model.as_str();
         let working_dir = self.agent.working_dir();
 
         build_system_prompt(model_id, working_dir, custom_prompt)
     }
 
-    async fn run_turn(
-        &self,
+    /// Run the agent until completion or user input needed
+    async fn run_agent(
+        &mut self,
         messages: &mut Vec<async_openai::types::ChatCompletionRequestMessage>,
         cancellation: CancellationToken,
-    ) -> Result<TurnCompleteReason> {
+    ) -> Result<RunResult> {
+        use crow_agent::agent::init_coagent_session;
+
         let (tx, mut rx) = mpsc::unbounded_channel();
 
         let tools = self.tools.clone();
-        let registry = self.tool_registry.clone();
         let verbose = self.verbose;
         let telemetry = self.telemetry.clone();
 
+        // Initialize coagent messages if we have a coagent
+        let mut coagent_messages: Option<Vec<async_openai::types::ChatCompletionRequestMessage>> =
+            if self.coagent_tool_registry.is_some() {
+                // Initialize coagent session with inverted roles from primary
+                Some(init_coagent_session(messages))
+            } else {
+                None
+            };
+
+        // Use coagent tools from struct (or empty if no coagent)
+        let coagent_tools = &self.coagent_tools;
+
+        // Get coagent registry for tool execution (or fall back to primary registry)
+        let coagent_registry = self
+            .coagent_tool_registry
+            .as_ref()
+            .unwrap_or(&self.tool_registry);
+
         // Run agent and event processing concurrently
-        let agent_fut = self
-            .agent
-            .execute_turn(messages, &tools, &registry, &tx, cancellation);
+        let agent_fut = self.agent.run(
+            messages,
+            &tools,
+            &mut coagent_messages,
+            coagent_tools,
+            coagent_registry,
+            &tx,
+            cancellation,
+        );
 
         let event_fut = async {
             while let Some(event) = rx.recv().await {
@@ -246,10 +338,8 @@ impl CrowCli {
                         std::io::stdout().flush().ok();
                     }
                     AgentEvent::ThinkingDelta { delta, .. } => {
-                        if verbose {
-                            print!("\x1b[90m{}\x1b[0m", delta);
-                            std::io::stdout().flush().ok();
-                        }
+                        print!("\x1b[90m{}\x1b[0m", delta);
+                        std::io::stdout().flush().ok();
                     }
                     AgentEvent::ToolCallStart { tool, arguments, .. } => {
                         let args_preview = arguments.to_string();
@@ -309,6 +399,12 @@ impl CrowCli {
                             );
                         }
                     }
+                    AgentEvent::CoagentStart { primary, coagent } => {
+                        println!("\x1b[35m⟳ Coagent {} reviewing {}...\x1b[0m", coagent, primary);
+                    }
+                    AgentEvent::CoagentEnd { coagent, .. } => {
+                        println!("\x1b[35m✓ Coagent {} done\x1b[0m", coagent);
+                    }
                     AgentEvent::Error { error, .. } => {
                         eprintln!("\x1b[31mError: {}\x1b[0m", error);
                         telemetry.log_error("agent", error).await;
@@ -320,58 +416,150 @@ impl CrowCli {
 
         // Run both concurrently - agent produces events, we consume them
         let (result, _) = tokio::join!(agent_fut, event_fut);
-        let result = result.map_err(|e| anyhow::anyhow!(e))?;
-        Ok(result.reason)
+        Ok(result)
     }
 
-    async fn chat(&self, message: &str) -> Result<()> {
-        // Log user message
-        self.telemetry.log_user_message(message).await;
+    /// Load messages from a previous session to continue it
+    fn load_session_messages(&self, session_prefix: &str) -> Result<Vec<async_openai::types::ChatCompletionRequestMessage>> {
+        use rusqlite::Connection;
 
-        let mut messages = vec![
+        let conn = Connection::open(self.telemetry.db_path())?;
+
+        // Find session matching prefix
+        let session_id: String = conn.query_row(
+            "SELECT DISTINCT session_id FROM traces WHERE session_id LIKE ?1 ORDER BY started_at DESC LIMIT 1",
+            [format!("{}%", session_prefix)],
+            |row| row.get(0),
+        ).map_err(|_| anyhow::anyhow!("Session not found: {}", session_prefix))?;
+
+        println!("Continuing session: {}", &session_id[..8]);
+
+        // Get the last trace's request_messages - this contains the full conversation history
+        let request_messages: String = conn.query_row(
+            r#"SELECT request_messages FROM traces WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1"#,
+            [&session_id],
+            |row| row.get(0),
+        )?;
+
+        // Parse the messages
+        let json_messages: Vec<serde_json::Value> = serde_json::from_str(&request_messages)?;
+
+        let mut messages: Vec<async_openai::types::ChatCompletionRequestMessage> = Vec::new();
+
+        // Replace system prompt with current one (in case it changed)
+        messages.push(
             async_openai::types::ChatCompletionRequestSystemMessageArgs::default()
                 .content(self.system_prompt())
                 .build()?
                 .into(),
+        );
+
+        // Add all non-system messages from the history
+        for msg in json_messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+
+            match role {
+                "system" => continue, // Skip, we added fresh system prompt
+                "user" => {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        messages.push(
+                            async_openai::types::ChatCompletionRequestUserMessageArgs::default()
+                                .content(content)
+                                .build()?
+                                .into(),
+                        );
+                    }
+                }
+                "assistant" => {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        messages.push(
+                            async_openai::types::ChatCompletionRequestAssistantMessageArgs::default()
+                                .content(content)
+                                .build()?
+                                .into(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Also get the last response and add it
+        let last_response: Option<String> = conn.query_row(
+            r#"SELECT response_content FROM traces WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1"#,
+            [&session_id],
+            |row| row.get(0),
+        ).ok().flatten();
+
+        if let Some(response) = last_response {
+            messages.push(
+                async_openai::types::ChatCompletionRequestAssistantMessageArgs::default()
+                    .content(response)
+                    .build()?
+                    .into(),
+            );
+        }
+
+        println!("Loaded {} messages from previous session", messages.len() - 1);
+        Ok(messages)
+    }
+
+    /// Chat with optional session continuation
+    async fn chat_with_history(&mut self, message: &str, session_id: Option<&str>) -> Result<()> {
+        // Log user message
+        self.telemetry.log_user_message(message).await;
+
+        let mut messages = if let Some(sid) = session_id {
+            self.load_session_messages(sid)?
+        } else {
+            vec![
+                async_openai::types::ChatCompletionRequestSystemMessageArgs::default()
+                    .content(self.system_prompt())
+                    .build()?
+                    .into(),
+            ]
+        };
+
+        // Add the new user message
+        messages.push(
             async_openai::types::ChatCompletionRequestUserMessageArgs::default()
                 .content(message)
                 .build()?
                 .into(),
-        ];
+        );
 
         let cancellation = get_shutdown_token();
         let start = std::time::Instant::now();
 
-        loop {
-            let reason = self.run_turn(&mut messages, cancellation.clone()).await?;
+        let result = self.run_agent(&mut messages, cancellation).await?;
 
-            match reason {
-                TurnCompleteReason::TaskComplete { ref summary } => {
-                    let duration = start.elapsed().as_millis() as u64;
-                    self.telemetry
-                        .log_response(summary, None, duration, Some(&self.model), None)
-                        .await;
-                    println!("\x1b[36m✓ Task complete: {}\x1b[0m", summary);
-                    break;
-                }
-                TurnCompleteReason::TextResponse => {
-                    break;
-                }
-                TurnCompleteReason::MaxIterations => {
-                    println!("\x1b[33m⚠ Max iterations reached\x1b[0m");
-                    break;
-                }
-                TurnCompleteReason::Cancelled => {
-                    println!("\x1b[33m⚠ Cancelled\x1b[0m");
-                    break;
-                }
+        match result {
+            RunResult::Complete { summary, total_turns } => {
+                let duration = start.elapsed().as_millis() as u64;
+                self.telemetry
+                    .log_response(&summary, None, duration, Some(&self.model), None)
+                    .await;
+                println!("\x1b[36m✓ Task complete ({} turns): {}\x1b[0m", total_turns, summary);
+            }
+            RunResult::NeedsInput { .. } => {
+                // Passthrough mode - agent returned control to user
+                println!();
+            }
+            RunResult::MaxTurns { turns } => {
+                println!("\x1b[33m⚠ Max turns reached ({})\x1b[0m", turns);
+            }
+            RunResult::Cancelled => {
+                println!("\x1b[33m⚠ Cancelled\x1b[0m");
+            }
+            RunResult::Error(e) => {
+                eprintln!("\x1b[31mError: {}\x1b[0m", e);
             }
         }
 
         Ok(())
     }
 
-    async fn run_repl(&self) -> Result<()> {
+    async fn run_repl(&mut self) -> Result<()> {
         println!("Crow Agent REPL");
         println!("Working directory: {}", self.agent.working_dir().display());
         println!("Session: {}", self.telemetry.session_id());
@@ -449,14 +637,17 @@ impl CrowCli {
 
                     let cancellation = get_shutdown_token();
 
-                    match self.run_turn(&mut messages, cancellation).await {
-                        Ok(reason) => {
-                            match reason {
-                                TurnCompleteReason::TaskComplete { summary } => {
+                    match self.run_agent(&mut messages, cancellation).await {
+                        Ok(result) => {
+                            match result {
+                                RunResult::Complete { summary, .. } => {
                                     println!("\x1b[36m✓ {}\x1b[0m", summary);
                                 }
-                                TurnCompleteReason::Cancelled => {
+                                RunResult::Cancelled => {
                                     println!("\x1b[33m⚠ Cancelled\x1b[0m");
+                                }
+                                RunResult::Error(e) => {
+                                    eprintln!("\x1b[31mError: {}\x1b[0m", e);
                                 }
                                 _ => {}
                             }
@@ -536,6 +727,37 @@ fn build_provider(cli: &Cli) -> Result<Arc<ProviderClient>> {
     Ok(Arc::new(
         ProviderClient::new(config).map_err(|e| anyhow::anyhow!(e))?,
     ))
+}
+
+fn build_acp_config(cli: &Cli, working_dir: PathBuf) -> Result<Config> {
+    let data_dir = default_data_dir();
+
+    // Get base_url from CLI or auth.json
+    let base_url = if let Some(ref url) = cli.base_url {
+        Some(url.clone())
+    } else {
+        let auth_path = data_dir.join("auth.json");
+        if let Ok(content) = std::fs::read_to_string(&auth_path) {
+            if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&content) {
+                auth.get(&cli.provider)
+                    .and_then(|e| e.get("base_url"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+
+    Ok(Config::lm_studio(
+        base_url.as_deref().unwrap_or("http://localhost:1234/v1"),
+        &cli.model,
+        working_dir,
+    )
+    .with_verbose(cli.verbose)
+    .with_log_dir(data_dir))
 }
 
 fn show_stats(telemetry: &Telemetry, limit: usize) -> Result<()> {
@@ -993,15 +1215,42 @@ async fn main() -> Result<()> {
     let data_dir = default_data_dir();
     std::fs::create_dir_all(&data_dir)?;
 
+    // Check if ACP mode (needs special telemetry - logs to stderr since stdout is JSON-RPC)
+    let is_acp_mode = matches!(cli.command, Some(Commands::Acp));
+
     // Initialize telemetry
-    let telemetry = Arc::new(Telemetry::init(
-        data_dir.clone(),
-        cli.verbose,
-        None, // No OTel endpoint for now
-        Some(&working_dir.display().to_string()),
-        Some(&cli.model),
-        Some(&cli.provider),
-    )?);
+    let telemetry = if is_acp_mode {
+        Arc::new(Telemetry::init_for_serve(
+            data_dir.clone(),
+            cli.verbose,
+            None, // No OTel endpoint for now
+            Some(&working_dir.display().to_string()),
+            Some(&cli.model),
+            Some(&cli.provider),
+        )?)
+    } else {
+        Arc::new(Telemetry::init(
+            data_dir.clone(),
+            cli.verbose,
+            None, // No OTel endpoint for now
+            Some(&working_dir.display().to_string()),
+            Some(&cli.model),
+            Some(&cli.provider),
+        )?)
+    };
+
+    // Handle ACP mode first (special handling for stdio server)
+    if let Some(Commands::Acp) = cli.command {
+        // Build config for ACP server
+        let config = build_acp_config(&cli, working_dir)?;
+
+        // Run as ACP server - use LocalSet for !Send futures
+        let local = tokio::task::LocalSet::new();
+        return local
+            .run_until(run_stdio_server(config, telemetry))
+            .await
+            .map_err(|e| anyhow::anyhow!("ACP server error: {:?}", e));
+    }
 
     // Handle non-agent commands first (don't need provider)
     match &cli.command {
@@ -1039,6 +1288,7 @@ async fn main() -> Result<()> {
             let mode = match agent.mode {
                 crow_agent::agent::AgentMode::Primary => "primary",
                 crow_agent::agent::AgentMode::Subagent => "subagent",
+                crow_agent::agent::AgentMode::Coagent => "coagent",
                 crow_agent::agent::AgentMode::All => "all",
             };
             let builtin = if agent.built_in { " (built-in)" } else { "" };
@@ -1067,7 +1317,7 @@ async fn main() -> Result<()> {
     }
 
     // Create CLI with selected agent
-    let crow = CrowCli::new(
+    let mut crow = CrowCli::new(
         provider,
         working_dir,
         telemetry.clone(),
@@ -1079,9 +1329,8 @@ async fn main() -> Result<()> {
     .await?;
 
     match cli.command {
-        Some(Commands::Prompt { message, session: _ }) => {
-            // TODO: implement session continuation
-            crow.chat(&message).await?;
+        Some(Commands::Prompt { message, session }) => {
+            crow.chat_with_history(&message, session.as_deref()).await?;
         }
         Some(Commands::Repl) | None => {
             crow.run_repl().await?;

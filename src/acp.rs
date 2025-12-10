@@ -89,9 +89,9 @@ impl CrowAcpAgent {
         // Build provider from config
         let base_url = config.llm.base_url.as_deref().unwrap_or("http://localhost:1234/v1");
         let provider_config = ProviderConfig::custom(
-            config.llm.provider.as_str(),
+            "lm-studio", // Use lm-studio as provider name for auth.json lookup
             base_url,
-            "UNUSED", // API key env var - not used for local
+            "LM_STUDIO_API_KEY", // Env var fallback
             &config.llm.model,
         );
         let provider = Arc::new(ProviderClient::new(provider_config)?);
