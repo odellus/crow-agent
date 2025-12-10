@@ -28,6 +28,7 @@
 
 ## General
 - Don't be incompetent
+- opencode is a typescript, not a go project
 
 ## Telemetry
 Use this to get the most recent messages

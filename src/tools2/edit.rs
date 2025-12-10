@@ -132,7 +132,7 @@ impl Tool for EditTool {
 
 Usage:
 - You must use `read_file` at least once before editing. This tool will error if you attempt an edit without reading the file first.
-- When editing text from read_file output, preserve the exact indentation (tabs/spaces) as it appears in the file.
+- When editing text from read_file output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: spaces + line number + tab. Everything after that tab is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.
 - The edit will FAIL if `oldString` is not found in the file.
 - The edit will FAIL if `oldString` is found multiple times. Provide more surrounding context to make it unique, or use `replaceAll: true`.
 - Use `replaceAll: true` to replace ALL occurrences (e.g., renaming a variable).

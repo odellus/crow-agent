@@ -18,12 +18,52 @@ use async_openai::types::{
     ChatCompletionToolType, FunctionCall,
 };
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Doom loop detection threshold - if 3 consecutive tool calls have the same
+/// name and identical arguments, we're likely stuck in a loop
+const DOOM_LOOP_THRESHOLD: usize = 3;
+
+/// Tracks recent tool calls for doom loop detection
+#[derive(Debug, Clone)]
+struct ToolCallRecord {
+    name: String,
+    args_hash: u64,
+}
+
+impl ToolCallRecord {
+    fn new(name: &str, args: &serde_json::Value) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Hash the canonical JSON string for consistent comparison
+        let args_str = serde_json::to_string(args).unwrap_or_default();
+        args_str.hash(&mut hasher);
+        Self {
+            name: name.to_string(),
+            args_hash: hasher.finish(),
+        }
+    }
+}
+
+/// Check if recent tool calls indicate a doom loop
+fn is_doom_loop(recent_calls: &VecDeque<ToolCallRecord>) -> bool {
+    if recent_calls.len() < DOOM_LOOP_THRESHOLD {
+        return false;
+    }
+
+    // Get the last DOOM_LOOP_THRESHOLD calls
+    let calls: Vec<_> = recent_calls.iter().rev().take(DOOM_LOOP_THRESHOLD).collect();
+
+    // Check if all have the same name and args hash
+    let first = &calls[0];
+    calls.iter().all(|c| c.name == first.name && c.args_hash == first.args_hash)
+}
 
 /// Internal agent that runs the ReAct loop
 #[derive(Clone)]
@@ -112,6 +152,9 @@ impl BaseAgent {
         let files_changed: Vec<PathBuf> = vec![];
         let mut final_text: Option<String> = None;
         let mut final_thinking: Option<String> = None;
+
+        // Track recent tool calls for doom loop detection
+        let mut recent_tool_calls: VecDeque<ToolCallRecord> = VecDeque::with_capacity(DOOM_LOOP_THRESHOLD + 1);
 
         // Emit turn start
         let _ = event_tx.send(AgentEvent::TurnStart {
@@ -385,6 +428,64 @@ impl BaseAgent {
 
                 let args: serde_json::Value =
                     serde_json::from_str(&tool_args_str).unwrap_or(serde_json::json!({}));
+
+                // Track this call for doom loop detection
+                let call_record = ToolCallRecord::new(&tool_name, &args);
+                recent_tool_calls.push_back(call_record);
+                if recent_tool_calls.len() > DOOM_LOOP_THRESHOLD {
+                    recent_tool_calls.pop_front();
+                }
+
+                // Check for doom loop - 3 identical consecutive tool calls
+                if is_doom_loop(&recent_tool_calls) {
+                    let doom_error = format!(
+                        "Doom loop detected: '{}' called {} times with identical arguments. \
+                        You seem to be stuck. Please try a different approach or ask for help.",
+                        tool_name, DOOM_LOOP_THRESHOLD
+                    );
+
+                    // Emit tool error event
+                    let _ = event_tx.send(AgentEvent::ToolCallStart {
+                        agent: self.name.clone(),
+                        call_id: tool_id.clone(),
+                        tool: tool_name.clone(),
+                        arguments: args.clone(),
+                    });
+                    let _ = event_tx.send(AgentEvent::ToolCallEnd {
+                        agent: self.name.clone(),
+                        call_id: tool_id.clone(),
+                        tool: tool_name.clone(),
+                        arguments: args.clone(),
+                        output: doom_error.clone(),
+                        is_error: true,
+                        duration_ms: 0,
+                    });
+
+                    // Track as error
+                    all_tool_calls.push(ExecutedToolCall {
+                        id: tool_id.clone(),
+                        name: tool_name.clone(),
+                        arguments: args,
+                        output: doom_error.clone(),
+                        is_error: true,
+                        duration_ms: 0,
+                    });
+
+                    // Add error to context so model sees it
+                    messages.push(ChatCompletionRequestMessage::Tool(
+                        ChatCompletionRequestToolMessageArgs::default()
+                            .content(doom_error)
+                            .tool_call_id(tool_id)
+                            .build()
+                            .map_err(|e| format!("Failed to build tool message: {}", e))?,
+                    ));
+
+                    // Clear recent calls so we give the model a fresh chance
+                    recent_tool_calls.clear();
+
+                    // Continue to next tool or iteration - don't execute this one
+                    continue;
+                }
 
                 // Emit tool start
                 let _ = event_tx.send(AgentEvent::ToolCallStart {
