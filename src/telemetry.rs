@@ -97,6 +97,16 @@ impl TelemetrySession {
         }
     }
 
+    /// Create a session with a specific ID (for resuming)
+    pub fn with_id(id: Uuid) -> Self {
+        Self {
+            id,
+            started_at: Utc::now(),
+            interaction_count: AtomicU64::new(0),
+            total_tokens: AtomicU64::new(0),
+        }
+    }
+
     pub fn next_interaction(&self) -> u64 {
         self.interaction_count.fetch_add(1, Ordering::SeqCst)
     }
@@ -193,6 +203,19 @@ impl TelemetryDb {
             CREATE INDEX IF NOT EXISTS idx_tool_calls_name ON tool_calls(tool_name);
             CREATE INDEX IF NOT EXISTS idx_traces_session ON traces(session_id);
             CREATE INDEX IF NOT EXISTS idx_traces_started ON traces(started_at);
+
+            -- Threads table: semantic message storage for session continuation
+            -- Following Zed's pattern: store typed messages, regenerate wire format on request
+            CREATE TABLE IF NOT EXISTS threads (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                data TEXT NOT NULL,
+                FOREIGN KEY (session_id) REFERENCES sessions(id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_threads_session ON threads(session_id);
+            CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at);
         "#)?;
 
         Ok(Self { conn })
@@ -257,6 +280,55 @@ impl TelemetryDb {
             ],
         )?;
         Ok(())
+    }
+
+    fn save_thread(&self, thread: &crate::message::Thread) -> anyhow::Result<()> {
+        let data = serde_json::to_string(thread)?;
+        let updated_at = thread.updated_at.unwrap_or_else(chrono::Utc::now).to_rfc3339();
+
+        self.conn.execute(
+            r#"INSERT OR REPLACE INTO threads (id, session_id, updated_at, data)
+               VALUES (?1, ?2, ?3, ?4)"#,
+            params![
+                thread.id,
+                thread.id, // session_id same as thread id for now
+                updated_at,
+                data
+            ],
+        )?;
+        Ok(())
+    }
+
+    fn load_thread(&self, id: &str) -> anyhow::Result<Option<crate::message::Thread>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT data FROM threads WHERE id LIKE ?1 ORDER BY updated_at DESC LIMIT 1"
+        )?;
+
+        let result: Option<String> = stmt.query_row([format!("{}%", id)], |row| row.get(0)).ok();
+
+        match result {
+            Some(data) => {
+                let thread: crate::message::Thread = serde_json::from_str(&data)?;
+                Ok(Some(thread))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn load_thread_by_session(&self, session_id: &str) -> anyhow::Result<Option<crate::message::Thread>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT data FROM threads WHERE session_id LIKE ?1 ORDER BY updated_at DESC LIMIT 1"
+        )?;
+
+        let result: Option<String> = stmt.query_row([format!("{}%", session_id)], |row| row.get(0)).ok();
+
+        match result {
+            Some(data) => {
+                let thread: crate::message::Thread = serde_json::from_str(&data)?;
+                Ok(Some(thread))
+            }
+            None => Ok(None),
+        }
     }
 
     fn insert_trace(&self, trace: &TraceRecord) -> anyhow::Result<()> {
@@ -723,7 +795,7 @@ impl TraceBuilder {
 
 /// Main telemetry handler
 pub struct Telemetry {
-    session: Arc<TelemetrySession>,
+    session: std::sync::RwLock<Arc<TelemetrySession>>,
     db: Arc<Mutex<TelemetryDb>>,
     log_dir: PathBuf,
     _file_guard: Option<WorkerGuard>,
@@ -861,7 +933,7 @@ impl Telemetry {
         );
 
         Ok(Self {
-            session,
+            session: std::sync::RwLock::new(session),
             db,
             log_dir,
             _file_guard: Some(file_guard),
@@ -880,7 +952,7 @@ impl Telemetry {
         db.insert_session(&session, None, None, None)?;
 
         Ok(Self {
-            session,
+            session: std::sync::RwLock::new(session),
             db: Arc::new(Mutex::new(db)),
             log_dir,
             _file_guard: None,
@@ -888,16 +960,28 @@ impl Telemetry {
         })
     }
 
+    /// Get the current session
+    fn session(&self) -> Arc<TelemetrySession> {
+        self.session.read().unwrap().clone()
+    }
+
     /// Get the current session ID
     pub fn session_id(&self) -> Uuid {
-        self.session.id
+        self.session().id
+    }
+
+    /// Resume a previous session by ID
+    /// This replaces the current session with the specified ID
+    pub fn resume_session(&self, session_id: Uuid) {
+        *self.session.write().unwrap() = Arc::new(TelemetrySession::with_id(session_id));
     }
 
     /// Log a user message
     pub async fn log_user_message(&self, content: &str) {
+        let session = self.session();
         let record = InteractionRecord {
             id: Uuid::new_v4(),
-            session_id: self.session.id,
+            session_id: session.id,
             timestamp: Utc::now(),
             interaction_type: InteractionType::UserMessage,
             duration_ms: None,
@@ -911,7 +995,7 @@ impl Telemetry {
             error: None,
         };
 
-        self.session.next_interaction();
+        session.next_interaction();
 
         tracing::info!(
             interaction_id = %record.id,
@@ -935,13 +1019,14 @@ impl Telemetry {
         model: Option<&str>,
         raw_response: Option<&str>,
     ) {
+        let session = self.session();
         if let Some(ref tc) = token_count {
-            self.session.add_tokens(tc.total_tokens as u64);
+            session.add_tokens(tc.total_tokens as u64);
         }
 
         let record = InteractionRecord {
             id: Uuid::new_v4(),
-            session_id: self.session.id,
+            session_id: session.id,
             timestamp: Utc::now(),
             interaction_type: InteractionType::AssistantMessage,
             duration_ms: Some(duration_ms),
@@ -955,7 +1040,7 @@ impl Telemetry {
             error: None,
         };
 
-        self.session.next_interaction();
+        session.next_interaction();
 
         tracing::info!(
             interaction_id = %record.id,
@@ -995,10 +1080,11 @@ impl Telemetry {
             duration_ms,
         };
 
+        let session = self.session();
         let interaction_id = Uuid::new_v4();
         let record = InteractionRecord {
             id: interaction_id,
-            session_id: self.session.id,
+            session_id: session.id,
             timestamp: Utc::now(),
             interaction_type: InteractionType::ToolCall,
             duration_ms: Some(duration_ms),
@@ -1012,7 +1098,7 @@ impl Telemetry {
             error: error_str,
         };
 
-        self.session.next_interaction();
+        session.next_interaction();
 
         tracing::info!(
             tool = tool_name,
@@ -1028,17 +1114,18 @@ impl Telemetry {
 
         if let Ok(db) = self.db.lock() {
             let _ = db.insert_interaction(&record);
-            let _ = db.insert_tool_call(interaction_id, self.session.id, &tool_record);
+            let _ = db.insert_tool_call(interaction_id, session.id, &tool_record);
         }
     }
 
     /// Log an error
     pub async fn log_error(&self, context: &str, error: &str) {
+        let session = self.session();
         tracing::error!(context = context, error = error, "Error occurred");
 
         let record = InteractionRecord {
             id: Uuid::new_v4(),
-            session_id: self.session.id,
+            session_id: session.id,
             timestamp: Utc::now(),
             interaction_type: InteractionType::AssistantMessage,
             duration_ms: None,
@@ -1067,7 +1154,7 @@ impl Telemetry {
         request_messages: impl Into<String>,
     ) -> TraceBuilder {
         TraceBuilder::new(
-            self.session.id,
+            self.session().id,
             agent_name,
             model_provider,
             model_id,
@@ -1102,11 +1189,12 @@ impl Telemetry {
 
     /// Get session statistics
     pub fn stats(&self) -> SessionStats {
+        let session = self.session();
         SessionStats {
-            session_id: self.session.id,
-            started_at: self.session.started_at,
-            interaction_count: self.session.interaction_count.load(Ordering::SeqCst),
-            total_tokens: self.session.total_tokens.load(Ordering::SeqCst),
+            session_id: session.id,
+            started_at: session.started_at,
+            interaction_count: session.interaction_count.load(Ordering::SeqCst),
+            total_tokens: session.total_tokens.load(Ordering::SeqCst),
         }
     }
 
@@ -1179,6 +1267,24 @@ impl Telemetry {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    /// Save a thread (semantic message history) to the database
+    pub fn save_thread(&self, thread: &crate::message::Thread) -> anyhow::Result<()> {
+        let db = self.db.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        db.save_thread(thread)
+    }
+
+    /// Load a thread by ID (or ID prefix)
+    pub fn load_thread(&self, id: &str) -> anyhow::Result<Option<crate::message::Thread>> {
+        let db = self.db.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        db.load_thread(id)
+    }
+
+    /// Load a thread by session ID (or session ID prefix)
+    pub fn load_thread_by_session(&self, session_id: &str) -> anyhow::Result<Option<crate::message::Thread>> {
+        let db = self.db.lock().map_err(|e| anyhow::anyhow!("Lock error: {}", e))?;
+        db.load_thread_by_session(session_id)
     }
 }
 

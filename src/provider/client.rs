@@ -107,7 +107,12 @@ impl ProviderClient {
             .with_api_base(&config.base_url);
 
         let client = Client::with_config(openai_config);
-        let http_client = reqwest::Client::new();
+        // Build HTTP client with connection close behavior
+        // This ensures connections are closed properly on drop
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(0) // Don't keep connections alive
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
         Ok(Self {
             config,
@@ -242,11 +247,13 @@ impl ProviderClient {
 
         // Make the HTTP request cancellable - this is critical for llama.cpp
         // which can take minutes during prompt processing
+        // Use Connection: close to ensure server doesn't keep-alive
         let request_fut = self
             .http_client
             .post(format!("{}/chat/completions", self.config.base_url))
             .header("Authorization", format!("Bearer {}", api_key))
             .header("Content-Type", "application/json")
+            .header("Connection", "close")
             .json(&body)
             .send();
 

@@ -45,17 +45,23 @@ fn clear_global_guard() {
     }
 }
 
-fn flush_global_guard() {
-    if let Some(slot) = INTERACTION_GUARD.get() {
-        if let Ok(g) = slot.lock() {
-            if let Some(ref guard) = *g {
-                // Try to flush - use blocking lock since we're in signal context
-                if let Ok(inner) = guard.try_lock() {
-                    inner.flush();
-                }
-            }
+async fn flush_global_guard_async() {
+    let guard = {
+        let slot = match INTERACTION_GUARD.get() {
+            Some(s) => s,
+            None => return,
+        };
+        let g = match slot.lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        match g.as_ref() {
+            Some(guard) => guard.clone(),
+            None => return,
         }
-    }
+    };
+    let inner = guard.lock().await;
+    inner.flush();
 }
 
 /// Get the default data directory
@@ -183,6 +189,9 @@ struct CrowCli {
     verbose: bool,
     data_dir: PathBuf,
     model: String,
+    /// Semantic message history (Thread) - used for session continuation
+    /// Following Zed's pattern: store semantic messages, regenerate wire format on request
+    thread: crow_agent::Thread,
 }
 
 impl CrowCli {
@@ -296,6 +305,9 @@ impl CrowCli {
             .filter(|t| agent_config.is_tool_enabled(&t.function.name))
             .collect();
 
+        // Initialize thread with session ID
+        let thread = crow_agent::Thread::new(telemetry.session_id().to_string());
+
         Ok(Self {
             agent,
             tool_registry,
@@ -306,6 +318,7 @@ impl CrowCli {
             verbose,
             data_dir,
             model,
+            thread,
         })
     }
 
@@ -321,17 +334,21 @@ impl CrowCli {
     /// Run the agent until completion or user input needed
     /// Returns RunResult. Interaction logging is handled by InteractionGuard which
     /// saves to DB on drop, surviving cancellation.
+    /// Also updates self.thread with the agent's response for session continuation.
     async fn run_agent(
         &mut self,
         messages: &mut Vec<async_openai::types::ChatCompletionRequestMessage>,
         cancellation: CancellationToken,
     ) -> Result<RunResult> {
         use crow_agent::agent::init_coagent_session;
-        use crow_agent::InteractionGuard;
+        use crow_agent::{AgentMessage, InteractionGuard};
         use std::sync::Arc;
         use tokio::sync::Mutex;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
+
+        // Accumulate agent response for thread update
+        let agent_message = Arc::new(Mutex::new(AgentMessage::default()));
 
         let tools = self.tools.clone();
         let verbose = self.verbose;
@@ -373,14 +390,23 @@ impl CrowCli {
         let guard = Arc::new(Mutex::new(InteractionGuard::new(telemetry.clone(), Some(model))));
         set_global_guard(guard.clone());
         let guard_clone = guard.clone();
+        let agent_msg_clone = agent_message.clone();
+
+        // Track current tool call for matching with result
+        let current_tool_id = Arc::new(Mutex::new(String::new()));
+        let current_tool_id_clone = current_tool_id.clone();
 
         let event_fut = async move {
+            // Accumulate text content
+            let mut text_buffer = String::new();
+
             while let Some(event) = rx.recv().await {
                 match &event {
                     AgentEvent::TextDelta { delta, .. } => {
                         print!("{}", delta);
                         std::io::stdout().flush().ok();
                         guard_clone.lock().await.push_text(delta);
+                        text_buffer.push_str(delta);
                     }
                     AgentEvent::ThinkingDelta { delta, .. } => {
                         print!("\x1b[90m{}\x1b[0m", delta);
@@ -390,15 +416,29 @@ impl CrowCli {
                     AgentEvent::ThinkingComplete { .. } => {
                         guard_clone.lock().await.end_thinking();
                     }
-                    AgentEvent::ToolCallStart { tool, arguments, .. } => {
+                    AgentEvent::ToolCallStart { call_id, tool, arguments, .. } => {
+                        // Flush any accumulated text first
+                        if !text_buffer.is_empty() {
+                            agent_msg_clone.lock().await.push_text(&text_buffer);
+                            text_buffer.clear();
+                        }
+
                         let args_preview = arguments.to_string();
                         let args_short = if args_preview.len() > 60 {
                             format!("{}...", &args_preview[..60])
                         } else {
-                            args_preview
+                            args_preview.clone()
                         };
                         println!("\n\x1b[33m▶ {}: {}\x1b[0m", tool, args_short);
                         guard_clone.lock().await.push_tool_call(tool, &args_short);
+
+                        // Add tool use to agent message
+                        *current_tool_id_clone.lock().await = call_id.clone();
+                        agent_msg_clone.lock().await.push_tool_use(
+                            call_id.clone(),
+                            tool.clone(),
+                            args_preview,
+                        );
                     }
                     AgentEvent::ToolCallEnd {
                         tool,
@@ -431,8 +471,24 @@ impl CrowCli {
                             println!("\x1b[32m✓ {} ({}ms): {}\x1b[0m", tool, duration_ms, preview);
                             guard_clone.lock().await.push_tool_result(&preview);
                         }
+
+                        // Add tool result to agent message
+                        let tool_id = current_tool_id_clone.lock().await.clone();
+                        if !tool_id.is_empty() {
+                            agent_msg_clone.lock().await.add_tool_result(
+                                tool_id,
+                                tool.clone(),
+                                output.clone(),
+                                *is_error,
+                            );
+                        }
                     }
                     AgentEvent::TurnComplete { .. } => {
+                        // Flush any remaining text
+                        if !text_buffer.is_empty() {
+                            agent_msg_clone.lock().await.push_text(&text_buffer);
+                            text_buffer.clear();
+                        }
                         println!();
                         // Flush to DB periodically (every turn)
                         guard_clone.lock().await.flush();
@@ -469,6 +525,11 @@ impl CrowCli {
                     _ => {}
                 }
             }
+
+            // Flush any final text
+            if !text_buffer.is_empty() {
+                agent_msg_clone.lock().await.push_text(&text_buffer);
+            }
         };
 
         // Run both concurrently - agent produces events, we consume them
@@ -481,11 +542,21 @@ impl CrowCli {
             g.into_inner().complete();
         }
 
+        // Add agent message to thread (for session continuation)
+        if let Ok(msg) = Arc::try_unwrap(agent_message) {
+            let agent_msg = msg.into_inner();
+            // Only add if there's actual content
+            if !agent_msg.content.is_empty() || !agent_msg.tool_results.is_empty() {
+                self.thread.push_agent(agent_msg);
+            }
+        }
+
         Ok(result)
     }
 
     /// Load messages from a previous session to continue it
-    fn load_session_messages(&self, session_prefix: &str) -> Result<Vec<async_openai::types::ChatCompletionRequestMessage>> {
+    /// Returns (messages, session_uuid)
+    fn load_session_messages(&self, session_prefix: &str) -> Result<(Vec<async_openai::types::ChatCompletionRequestMessage>, uuid::Uuid)> {
         use rusqlite::Connection;
 
         let conn = Connection::open(self.telemetry.db_path())?;
@@ -497,6 +568,7 @@ impl CrowCli {
             |row| row.get(0),
         ).map_err(|_| anyhow::anyhow!("Session not found: {}", session_prefix))?;
 
+        let session_uuid = uuid::Uuid::parse_str(&session_id)?;
         println!("Continuing session: {}", &session_id[..8]);
 
         // Get the last trace's request_messages - this contains the full conversation history
@@ -511,20 +583,23 @@ impl CrowCli {
 
         let mut messages: Vec<async_openai::types::ChatCompletionRequestMessage> = Vec::new();
 
-        // Replace system prompt with current one (in case it changed)
-        messages.push(
-            async_openai::types::ChatCompletionRequestSystemMessageArgs::default()
-                .content(self.system_prompt())
-                .build()?
-                .into(),
-        );
-
-        // Add all non-system messages from the history
+        // Add all messages from the history INCLUDING the original system prompt
+        // This is critical for llama.cpp caching - the prompt must be identical
+        // We must preserve tool_calls and tool results exactly as they were
         for msg in json_messages {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
 
             match role {
-                "system" => continue, // Skip, we added fresh system prompt
+                "system" => {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        messages.push(
+                            async_openai::types::ChatCompletionRequestSystemMessageArgs::default()
+                                .content(content)
+                                .build()?
+                                .into(),
+                        );
+                    }
+                }
                 "user" => {
                     if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
                         messages.push(
@@ -536,78 +611,146 @@ impl CrowCli {
                     }
                 }
                 "assistant" => {
-                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    // Must include tool_calls if present, not just content
+                    let content = msg.get("content").and_then(|c| c.as_str()).map(|s| s.to_string());
+                    let tool_calls = msg.get("tool_calls").cloned();
+
+                    if let Some(tool_calls_json) = tool_calls {
+                        // Parse tool_calls from JSON
+                        if let Ok(calls) = serde_json::from_value::<Vec<async_openai::types::ChatCompletionMessageToolCall>>(tool_calls_json) {
+                            let mut builder = async_openai::types::ChatCompletionRequestAssistantMessageArgs::default();
+                            if let Some(ref c) = content {
+                                builder.content(c.clone());
+                            }
+                            builder.tool_calls(calls);
+                            messages.push(builder.build()?.into());
+                        }
+                    } else if let Some(c) = content {
                         messages.push(
                             async_openai::types::ChatCompletionRequestAssistantMessageArgs::default()
-                                .content(content)
+                                .content(c)
                                 .build()?
                                 .into(),
                         );
                     }
                 }
+                "tool" => {
+                    // Tool result messages
+                    let tool_call_id = msg.get("tool_call_id").and_then(|t| t.as_str()).unwrap_or("");
+                    let content = msg.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    messages.push(
+                        async_openai::types::ChatCompletionRequestToolMessageArgs::default()
+                            .tool_call_id(tool_call_id)
+                            .content(content)
+                            .build()?
+                            .into(),
+                    );
+                }
                 _ => {}
             }
         }
 
-        // Also get the last response and add it
-        let last_response: Option<String> = conn.query_row(
-            r#"SELECT response_content FROM traces WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1"#,
+        // Also get the last response (content and/or tool_calls) and add it
+        let (last_response, last_tool_calls): (Option<String>, Option<String>) = conn.query_row(
+            r#"SELECT response_content, response_tool_calls FROM traces WHERE session_id = ?1 ORDER BY started_at DESC LIMIT 1"#,
             [&session_id],
-            |row| row.get(0),
-        ).ok().flatten();
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
 
-        if let Some(response) = last_response {
-            messages.push(
-                async_openai::types::ChatCompletionRequestAssistantMessageArgs::default()
-                    .content(response)
-                    .build()?
-                    .into(),
-            );
+        // Add last assistant response if it had content or tool_calls
+        if last_response.is_some() || last_tool_calls.is_some() {
+            let mut builder = async_openai::types::ChatCompletionRequestAssistantMessageArgs::default();
+
+            if let Some(ref content) = last_response {
+                builder.content(content.clone());
+            }
+
+            if let Some(ref tool_calls_json) = last_tool_calls {
+                if let Ok(calls) = serde_json::from_str::<Vec<async_openai::types::ChatCompletionMessageToolCall>>(tool_calls_json) {
+                    builder.tool_calls(calls);
+                }
+            }
+
+            messages.push(builder.build()?.into());
         }
 
         println!("Loaded {} messages from previous session", messages.len() - 1);
-        Ok(messages)
+        Ok((messages, session_uuid))
     }
 
     /// Chat with optional session continuation
+    /// Uses Thread for semantic message storage - enables proper prompt caching
     async fn chat_with_history(&mut self, message: &str, session_id: Option<&str>) -> Result<()> {
+        // If continuing a session, load the Thread from DB
+        if let Some(sid) = session_id {
+            if let Some(loaded_thread) = self.telemetry.load_thread(sid)? {
+                println!("Continuing session: {}", &loaded_thread.id[..8.min(loaded_thread.id.len())]);
+                println!("Loaded {} messages from previous session", loaded_thread.messages.len());
+
+                // Resume telemetry session with same ID
+                if let Ok(uuid) = uuid::Uuid::parse_str(&loaded_thread.id) {
+                    self.telemetry.resume_session(uuid);
+                }
+
+                self.thread = loaded_thread;
+            } else {
+                // Fall back to old method if no Thread found
+                let (msgs, uuid) = self.load_session_messages(sid)?;
+                self.telemetry.resume_session(uuid);
+
+                // Note: We don't have a Thread, so we can't benefit from semantic storage
+                // This is for backwards compatibility with old sessions
+                self.telemetry.log_user_message(message).await;
+
+                let mut messages = msgs;
+                messages.push(
+                    async_openai::types::ChatCompletionRequestUserMessageArgs::default()
+                        .content(message)
+                        .build()?
+                        .into(),
+                );
+
+                let cancellation = get_shutdown_token();
+                let result = self.run_agent(&mut messages, cancellation).await?;
+                self.print_result(&result);
+                return Ok(());
+            }
+        }
+
+        // Add user message to thread
+        self.thread.push_user(message);
+
         // Log user message
         self.telemetry.log_user_message(message).await;
 
-        let mut messages = if let Some(sid) = session_id {
-            self.load_session_messages(sid)?
-        } else {
-            vec![
-                async_openai::types::ChatCompletionRequestSystemMessageArgs::default()
-                    .content(self.system_prompt())
-                    .build()?
-                    .into(),
-            ]
-        };
-
-        // Add the new user message
-        messages.push(
-            async_openai::types::ChatCompletionRequestUserMessageArgs::default()
-                .content(message)
-                .build()?
-                .into(),
-        );
+        // Generate wire format from thread (system prompt is fresh, history is from thread)
+        let system_prompt = self.system_prompt();
+        let mut messages = self.thread.to_request_messages(&system_prompt);
 
         let cancellation = get_shutdown_token();
 
-        // InteractionGuard handles logging (saves on drop, survives cancellation)
+        // Run agent
         let result = self.run_agent(&mut messages, cancellation).await?;
 
+        // Save thread after turn (for session continuation)
+        if let Err(e) = self.telemetry.save_thread(&self.thread) {
+            eprintln!("Warning: Failed to save thread: {}", e);
+        }
+
+        self.print_result(&result);
+        Ok(())
+    }
+
+    fn print_result(&self, result: &RunResult) {
         match result {
             RunResult::Complete { summary, total_turns } => {
                 println!("\x1b[36m✓ Task complete ({} turns): {}\x1b[0m", total_turns, summary);
             }
             RunResult::NeedsInput { .. } => {
-                // Passthrough mode - agent returned control to user
                 println!();
             }
             RunResult::MaxTurns { turns } => {
-                println!("\x1b[33m⚠ Max turns reached ({})\x1b[0m", turns);
+                println!("\x1b[33m⚠ Max turns reached ({})\x1b[0m", *turns);
             }
             RunResult::Cancelled => {
                 println!("\x1b[33m⚠ Cancelled\x1b[0m");
@@ -616,8 +759,6 @@ impl CrowCli {
                 eprintln!("\x1b[31mError: {}\x1b[0m", e);
             }
         }
-
-        Ok(())
     }
 
     async fn run_repl(&mut self) -> Result<()> {
@@ -1274,9 +1415,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        // Flush any pending interaction data before shutdown
-        flush_global_guard();
+        // Cancel first to abort HTTP request
         shutdown.cancel();
+
+        // Then flush interaction data
+        flush_global_guard_async().await;
+
+        // Give the main task a moment to exit gracefully, then force exit
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        eprintln!("⚠ Force exit after signal");
+        std::process::exit(130); // 128 + SIGINT(2)
     });
 
     let cli = Cli::parse();

@@ -41,6 +41,7 @@ pub mod auth;
 pub mod config;
 pub mod hooks;
 pub mod lsp;
+pub mod message;
 pub mod snapshot;
 pub mod telemetry;
 pub mod templates;
@@ -70,4 +71,5 @@ pub use telemetry::{InteractionGuard, Telemetry, TraceGuard};
 // New exports
 pub use agent::{Agent, AgentConfig, BaseAgent, ControlFlow};
 pub use events::{AgentEvent, AgentEventStream, TurnResult};
+pub use message::{AgentMessage, AgentMessageContent, Message, Thread, ToolResult, ToolUse, UserMessage};
 pub use provider::{ProviderClient, ProviderConfig, StreamDelta};
