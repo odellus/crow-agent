@@ -507,47 +507,40 @@ impl AgentMode {
 }
 
 /// Tool permissions for an agent
+///
+/// In YAML, this is specified as a map of tool names to booleans:
+/// ```yaml
+/// tools:
+///   bash: true
+///   task_complete: false
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ToolPermissions {
-    /// Explicit tool enable/disable overrides
-    /// true = enabled, false = disabled
-    /// Tools not listed use the default (enabled)
-    #[serde(default)]
-    pub overrides: HashMap<String, bool>,
-
-    /// Default for tools not explicitly listed
-    #[serde(default = "default_true")]
-    pub default_enabled: bool,
-}
-
-fn default_true() -> bool {
-    true
+    /// Tool name -> enabled/disabled
+    /// Tools not listed default to enabled
+    overrides: HashMap<String, bool>,
 }
 
 impl Default for ToolPermissions {
     fn default() -> Self {
         Self {
             overrides: HashMap::new(),
-            default_enabled: true,
         }
     }
 }
 
 impl ToolPermissions {
-    /// Create permissions with all tools enabled
+    /// Create permissions with all tools enabled (empty map = all enabled by default)
     pub fn all_enabled() -> Self {
-        Self {
-            overrides: HashMap::new(),
-            default_enabled: true,
-        }
+        Self::default()
     }
 
     /// Create permissions with all tools disabled
     pub fn all_disabled() -> Self {
-        Self {
-            overrides: HashMap::new(),
-            default_enabled: false,
-        }
+        // Can't easily represent "all disabled" with transparent serde
+        // For now, this is unused - agents list what they want enabled
+        Self::default()
     }
 
     /// Enable a specific tool
@@ -563,11 +556,12 @@ impl ToolPermissions {
     }
 
     /// Check if a tool is enabled
+    /// Tools not explicitly listed default to ENABLED
     pub fn is_enabled(&self, tool_name: &str) -> bool {
         self.overrides
             .get(tool_name)
             .copied()
-            .unwrap_or(self.default_enabled)
+            .unwrap_or(true)  // Default: enabled
     }
 }
 

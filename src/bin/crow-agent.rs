@@ -288,12 +288,16 @@ impl CrowCli {
     }
 
     /// Run the agent until completion or user input needed
+    /// Returns (RunResult, accumulated_output) where accumulated_output is the full
+    /// external session content (all text, tool calls, thinking from all agents)
     async fn run_agent(
         &mut self,
         messages: &mut Vec<async_openai::types::ChatCompletionRequestMessage>,
         cancellation: CancellationToken,
-    ) -> Result<RunResult> {
+    ) -> Result<(RunResult, String)> {
         use crow_agent::agent::init_coagent_session;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
 
         let (tx, mut rx) = mpsc::unbounded_channel();
 
@@ -320,26 +324,45 @@ impl CrowCli {
             .unwrap_or(&self.tool_registry);
 
         // Run agent and event processing concurrently
+        // Pass tx directly to agent - when agent.run returns, tx will be dropped
         let agent_fut = self.agent.run(
             messages,
             &tools,
             &mut coagent_messages,
             coagent_tools,
             coagent_registry,
-            &tx,
+            tx,  // Move tx into run, it will be dropped when run returns
             cancellation,
         );
 
-        let event_fut = async {
+        // Accumulate all output for the external session log
+        let accumulated = Arc::new(Mutex::new(String::new()));
+        let accumulated_clone = accumulated.clone();
+
+        let event_fut = async move {
             while let Some(event) = rx.recv().await {
                 match &event {
                     AgentEvent::TextDelta { delta, .. } => {
                         print!("{}", delta);
                         std::io::stdout().flush().ok();
+                        // Accumulate for external session
+                        accumulated_clone.lock().await.push_str(delta);
                     }
                     AgentEvent::ThinkingDelta { delta, .. } => {
                         print!("\x1b[90m{}\x1b[0m", delta);
                         std::io::stdout().flush().ok();
+                        // Accumulate thinking in a tag for external session
+                        let mut acc = accumulated_clone.lock().await;
+                        if !acc.ends_with("<thinking>") && !acc.contains("<thinking>") {
+                            acc.push_str("<thinking>");
+                        }
+                        acc.push_str(delta);
+                    }
+                    AgentEvent::ThinkingComplete { .. } => {
+                        let mut acc = accumulated_clone.lock().await;
+                        if acc.contains("<thinking>") && !acc.ends_with("</thinking>\n") {
+                            acc.push_str("</thinking>\n");
+                        }
                     }
                     AgentEvent::ToolCallStart { tool, arguments, .. } => {
                         let args_preview = arguments.to_string();
@@ -349,6 +372,9 @@ impl CrowCli {
                             args_preview
                         };
                         println!("\n\x1b[33m▶ {}: {}\x1b[0m", tool, args_short);
+                        // Accumulate tool call for external session
+                        let mut acc = accumulated_clone.lock().await;
+                        acc.push_str(&format!("\n[Tool: {} {}]\n", tool, args_short));
                     }
                     AgentEvent::ToolCallEnd {
                         tool,
@@ -371,6 +397,9 @@ impl CrowCli {
                         // Print to console
                         if *is_error {
                             println!("\x1b[31m✗ {} ({}ms): {}\x1b[0m", tool, duration_ms, output);
+                            // Accumulate error for external session
+                            let mut acc = accumulated_clone.lock().await;
+                            acc.push_str(&format!("[Tool Error: {}]\n", output));
                         } else {
                             let preview = if output.len() > 100 {
                                 format!("{}...", &output[..100])
@@ -378,6 +407,9 @@ impl CrowCli {
                                 output.clone()
                             };
                             println!("\x1b[32m✓ {} ({}ms): {}\x1b[0m", tool, duration_ms, preview);
+                            // Accumulate result for external session
+                            let mut acc = accumulated_clone.lock().await;
+                            acc.push_str(&format!("[Tool Result: {}]\n", preview));
                         }
                     }
                     AgentEvent::TurnComplete { .. } => {
@@ -401,13 +433,19 @@ impl CrowCli {
                     }
                     AgentEvent::CoagentStart { primary, coagent } => {
                         println!("\x1b[35m⟳ Coagent {} reviewing {}...\x1b[0m", coagent, primary);
+                        let mut acc = accumulated_clone.lock().await;
+                        acc.push_str(&format!("\n[Coagent {} reviewing {}]\n", coagent, primary));
                     }
                     AgentEvent::CoagentEnd { coagent, .. } => {
                         println!("\x1b[35m✓ Coagent {} done\x1b[0m", coagent);
+                        let mut acc = accumulated_clone.lock().await;
+                        acc.push_str(&format!("[Coagent {} done]\n", coagent));
                     }
                     AgentEvent::Error { error, .. } => {
                         eprintln!("\x1b[31mError: {}\x1b[0m", error);
                         telemetry.log_error("agent", error).await;
+                        let mut acc = accumulated_clone.lock().await;
+                        acc.push_str(&format!("[Error: {}]\n", error));
                     }
                     _ => {}
                 }
@@ -415,8 +453,13 @@ impl CrowCli {
         };
 
         // Run both concurrently - agent produces events, we consume them
+        // tx was moved into agent.run, so when it returns the channel closes
         let (result, _) = tokio::join!(agent_fut, event_fut);
-        Ok(result)
+
+        // Extract accumulated output
+        let output = accumulated.lock().await.clone();
+
+        Ok((result, output))
     }
 
     /// Load messages from a previous session to continue it
@@ -531,14 +574,18 @@ impl CrowCli {
         let cancellation = get_shutdown_token();
         let start = std::time::Instant::now();
 
-        let result = self.run_agent(&mut messages, cancellation).await?;
+        let (result, accumulated_output) = self.run_agent(&mut messages, cancellation).await?;
+        let duration = start.elapsed().as_millis() as u64;
+
+        // Log the full accumulated output as the external session's assistant message
+        if !accumulated_output.is_empty() {
+            self.telemetry
+                .log_response(&accumulated_output, None, duration, Some(&self.model), None)
+                .await;
+        }
 
         match result {
             RunResult::Complete { summary, total_turns } => {
-                let duration = start.elapsed().as_millis() as u64;
-                self.telemetry
-                    .log_response(&summary, None, duration, Some(&self.model), None)
-                    .await;
                 println!("\x1b[36m✓ Task complete ({} turns): {}\x1b[0m", total_turns, summary);
             }
             RunResult::NeedsInput { .. } => {
@@ -636,9 +683,18 @@ impl CrowCli {
                     );
 
                     let cancellation = get_shutdown_token();
+                    let start = std::time::Instant::now();
 
                     match self.run_agent(&mut messages, cancellation).await {
-                        Ok(result) => {
+                        Ok((result, accumulated_output)) => {
+                            // Log the full accumulated output as the external session's assistant message
+                            let duration = start.elapsed().as_millis() as u64;
+                            if !accumulated_output.is_empty() {
+                                self.telemetry
+                                    .log_response(&accumulated_output, None, duration, Some(&self.model), None)
+                                    .await;
+                            }
+
                             match result {
                                 RunResult::Complete { summary, .. } => {
                                     println!("\x1b[36m✓ {}\x1b[0m", summary);

@@ -568,7 +568,7 @@ impl Agent {
         coagent_messages: &mut Option<Vec<ChatCompletionRequestMessage>>,
         coagent_tools: &[ChatCompletionTool],
         tool_executor: &dyn ToolExecutor,
-        event_tx: &mpsc::UnboundedSender<AgentEvent>,
+        event_tx: mpsc::UnboundedSender<AgentEvent>,  // Takes ownership so channel closes when we return
         cancellation: CancellationToken,
     ) -> RunResult {
         let mut turns = 0;
@@ -591,7 +591,7 @@ impl Agent {
                     primary_messages,
                     primary_tools,
                     tool_executor,
-                    event_tx,
+                    &event_tx,
                     cancellation.clone(),
                 )
                 .await
@@ -694,7 +694,7 @@ impl Agent {
                                     coagent_msgs,
                                     coagent_tools,
                                     tool_executor,
-                                    event_tx,
+                                    &event_tx,
                                     cancellation.clone(),
                                 )
                                 .await
