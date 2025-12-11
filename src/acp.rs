@@ -61,6 +61,8 @@ struct Session {
     coagent_registry: Option<ToolRegistry>,
     /// Coagent tools (if using coagent mode)
     coagent_tools: Vec<ChatCompletionTool>,
+    /// Shared TodoStore - persists across mode switches
+    todo_store: TodoStore,
     /// Conversation history
     history: RefCell<Vec<ChatCompletionRequestMessage>>,
     /// Cancellation token for current operation
@@ -181,9 +183,11 @@ impl acp::Agent for CrowAcpAgent {
         let agent_registry = AgentRegistry::new_with_config(&working_dir).await;
 
         // Build available modes from agent registry
+        // Only include agents that can be used as primary (not subagents or coagents)
         let all_agents = agent_registry.get_all().await;
         let available_modes: Vec<SessionMode> = all_agents
             .iter()
+            .filter(|config| config.mode.is_primary())
             .map(|config| {
                 let mode = SessionMode::new(
                     SessionModeId::new(config.name.as_str()),
@@ -330,6 +334,7 @@ impl acp::Agent for CrowAcpAgent {
                 tools,
                 coagent_registry,
                 coagent_tools,
+                todo_store,
                 history: RefCell::new(history),
                 cancellation: RefCell::new(None),
                 snapshot_manager,
@@ -354,12 +359,12 @@ impl acp::Agent for CrowAcpAgent {
         let new_mode_id = args.mode_id.0.to_string();
         info!("ACP set_session_mode: session_id={}, mode_id={}", session_id, new_mode_id);
 
-        // Get session data we need
-        let (agent_registry, working_dir) = {
+        // Get session data we need (including existing TodoStore to preserve state)
+        let (agent_registry, working_dir, todo_store) = {
             let sessions = self.sessions.borrow();
             let session = sessions.get(&session_id)
                 .ok_or_else(acp::Error::invalid_params)?;
-            (session.agent_registry.clone(), session.working_dir.clone())
+            (session.agent_registry.clone(), session.working_dir.clone(), session.todo_store.clone())
         };
 
         // Load the new agent config
@@ -372,8 +377,7 @@ impl acp::Agent for CrowAcpAgent {
         // Get control flow from agent config
         let control_flow = agent_config.get_control_flow();
 
-        // Create shared TodoStore
-        let todo_store = TodoStore::new();
+        // Reuse existing TodoStore from session (preserves todos across mode switches)
         let telemetry_session_id = self.telemetry.session_id().to_string();
 
         // Check if we need a coagent

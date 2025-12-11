@@ -711,6 +711,18 @@ impl Agent {
 
                             // Check if coagent called task_complete
                             if let Some(summary) = coagent_result.task_complete_summary() {
+                                // Add coagent's turn to primary context before returning
+                                // so the session history shows what the coagent did
+                                let feedback = humanize_turn(&coagent_result);
+                                if !feedback.is_empty() {
+                                    primary_messages.push(
+                                        async_openai::types::ChatCompletionRequestUserMessageArgs::default()
+                                            .content(feedback)
+                                            .build()
+                                            .unwrap()
+                                            .into(),
+                                    );
+                                }
                                 return RunResult::Complete {
                                     summary: summary.to_string(),
                                     total_turns: turns,

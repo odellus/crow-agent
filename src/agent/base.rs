@@ -321,7 +321,8 @@ impl BaseAgent {
             // Wait for stream to complete
             let stream_result = stream_handle.await;
 
-            // Add tool calls to trace guard
+            // Add tool calls to trace guard and flush
+            // This ensures tool calls are saved even if we crash during tool execution
             if let Some(ref mut guard) = trace_guard {
                 for (_, (id, name, args)) in &tool_call_parts {
                     guard.push_tool_call(id, name, args);
@@ -332,6 +333,8 @@ impl BaseAgent {
                     Err(e) => guard.set_error(e.to_string()),
                     Ok(Ok(())) => {}
                 }
+                // Flush to ensure tool calls are persisted
+                guard.flush();
             }
 
             // NOTE: Don't complete trace here - wait until after tool execution
