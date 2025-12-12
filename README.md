@@ -1,5 +1,24 @@
 # Crow Agent
 
+```
+
+
+                       ██████╗ ██████╗   ██████╗  ██╗    ██╗
+                      ██╔════╝ ██╔══██╗ ██╔═══██╗ ██║    ██║
+                      ██║      ██████╔╝ ██║   ██║ ██║ █╗ ██║
+                      ██║      ██╔══██╗ ██║   ██║ ██║███╗██║
+                      ╚██████╗ ██║  ██║ ╚██████╔╝ ╚███╔███╔╝
+                       ╚═════╝ ╚═╝  ╚═╝  ╚═════╝   ╚══╝╚══╝
+
+                  █████╗   ██████╗  ███████╗ ███╗   ██╗ ████████╗
+                 ██╔══██╗ ██╔════╝  ██╔════╝ ████╗  ██║ ╚══██╔══╝
+                 ███████║ ██║  ███╗ █████╗   ██╔██╗ ██║    ██║
+                 ██╔══██║ ██║   ██║ ██╔══╝   ██║╚██╗██║    ██║
+                 ██║  ██║ ╚██████╔╝ ███████╗ ██║ ╚████║    ██║
+                 ╚═╝  ╚═╝  ╚═════╝  ╚══════╝ ╚═╝  ╚═══╝    ╚═╝
+
+```
+
 A standalone LLM-powered coding agent built in Rust, designed for editor integration via the Agent Client Protocol (ACP).
 
 Crow Agent provides a full agentic coding experience with streaming, tool use, multi-turn conversations, cancellation support, and comprehensive telemetry - all in a single binary.
