@@ -222,7 +222,10 @@ impl BaseAgent {
             // Accumulate response
             let mut accumulated_text = String::new();
             let mut accumulated_thinking = String::new();
+            // Track tool calls: (id, name, arguments)
+            // We also track which ones we've already emitted ToolCallPending for
             let mut tool_call_parts: HashMap<usize, (String, String, String)> = HashMap::new();
+            let mut pending_emitted: std::collections::HashSet<usize> = std::collections::HashSet::new();
 
             // Process streaming deltas
             loop {
@@ -285,12 +288,26 @@ impl BaseAgent {
                             .entry(index)
                             .or_insert_with(|| (String::new(), String::new(), String::new()));
                         if let Some(id) = id {
-                            entry.0 = id;
+                            entry.0 = id.clone();
                         }
                         if let Some(name) = name {
-                            entry.1 = name;
+                            entry.1 = name.clone();
                         }
                         entry.2.push_str(&arguments);
+
+                        // Emit ToolCallPending as soon as we have both id and name
+                        // This lets the UI show which tool is being called while arguments stream
+                        if !pending_emitted.contains(&index)
+                            && !entry.0.is_empty()
+                            && !entry.1.is_empty()
+                        {
+                            pending_emitted.insert(index);
+                            let _ = event_tx.send(AgentEvent::ToolCallPending {
+                                agent: self.name.clone(),
+                                call_id: entry.0.clone(),
+                                tool: entry.1.clone(),
+                            });
+                        }
                     }
                     StreamDelta::Usage {
                         input,

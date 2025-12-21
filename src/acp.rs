@@ -816,15 +816,16 @@ impl CrowAcpAgent {
                             .await;
                     }
 
-                    AgentEvent::ToolCallStart {
+                    AgentEvent::ToolCallPending {
                         call_id,
                         tool,
-                        arguments,
                         ..
                     } => {
+                        // Tool call detected, arguments still streaming
+                        // Show pending status so user knows what's happening
                         let tool_call_id = ToolCallId::from(call_id);
                         let kind = tool_name_to_kind(&tool);
-                        let title = format!("Calling {}", tool);
+                        let title = tool_title_pending(&tool);
 
                         let _ = self
                             .send_update(SessionNotification::new(
@@ -832,9 +833,32 @@ impl CrowAcpAgent {
                                 SessionUpdate::ToolCall(
                                     ToolCall::new(tool_call_id, title)
                                         .kind(kind)
-                                        .status(ToolCallStatus::InProgress)
-                                        .raw_input(arguments.clone()),
+                                        .status(ToolCallStatus::Pending),
                                 ),
+                            ))
+                            .await;
+                    }
+
+                    AgentEvent::ToolCallStart {
+                        call_id,
+                        tool,
+                        arguments,
+                        ..
+                    } => {
+                        let tool_call_id = ToolCallId::from(call_id);
+                        let title = tool_title_from_args(&tool, &arguments);
+
+                        // Update the pending tool call to in_progress with full info
+                        let _ = self
+                            .send_update(SessionNotification::new(
+                                acp_session_id.clone(),
+                                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                    tool_call_id,
+                                    ToolCallUpdateFields::new()
+                                        .status(ToolCallStatus::InProgress)
+                                        .title(title)
+                                        .raw_input(arguments.clone()),
+                                )),
                             ))
                             .await;
 
@@ -983,13 +1007,129 @@ impl CrowAcpAgent {
 fn tool_name_to_kind(name: &str) -> ToolKind {
     match name {
         "read_file" => ToolKind::Read,
-        "edit_file" => ToolKind::Edit,
+        "edit" | "write_file" => ToolKind::Edit,
         "list_directory" => ToolKind::Read,
         "grep" | "find_path" => ToolKind::Search,
-        "terminal" => ToolKind::Execute,
-        "thinking" => ToolKind::Think,
+        "bash" => ToolKind::Execute,
+        "todo_write" | "todo_read" | "task" => ToolKind::Think,
         "fetch" | "web_search" => ToolKind::Fetch,
         _ => ToolKind::Other,
+    }
+}
+
+/// Generate a pending title for a tool (before we have arguments)
+fn tool_title_pending(name: &str) -> String {
+    match name {
+        "read_file" => "Reading file...".to_string(),
+        "edit" => "Editing file...".to_string(),
+        "write_file" => "Writing file...".to_string(),
+        "bash" => "Running command...".to_string(),
+        "grep" => "Searching...".to_string(),
+        "find_path" => "Finding files...".to_string(),
+        "list_directory" => "Listing directory...".to_string(),
+        "fetch" => "Fetching URL...".to_string(),
+        "web_search" => "Searching web...".to_string(),
+        "todo_write" => "Updating todos...".to_string(),
+        "todo_read" => "Reading todos...".to_string(),
+        "task" => "Spawning task...".to_string(),
+        "task_complete" => "Completing task...".to_string(),
+        _ => format!("{}...", name),
+    }
+}
+
+/// Generate a title for a tool from its arguments (like claude-code-acp's toolInfoFromToolUse)
+fn tool_title_from_args(name: &str, args: &serde_json::Value) -> String {
+    match name {
+        "read_file" => {
+            let path = args
+                .get("filePath")
+                .or_else(|| args.get("path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("file");
+            format!("Read `{}`", path)
+        }
+        "edit" => {
+            let path = args
+                .get("filePath")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("file");
+            format!("Edit `{}`", path)
+        }
+        "write_file" => {
+            let path = args
+                .get("filePath")
+                .or_else(|| args.get("file_path"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("file");
+            format!("Write `{}`", path)
+        }
+        "bash" => {
+            let cmd = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("command");
+            // Escape backticks in command and truncate if too long
+            let escaped = cmd.replace('`', "\\`");
+            let truncated = if escaped.len() > 60 {
+                format!("{}...", &escaped[..57])
+            } else {
+                escaped
+            };
+            format!("`{}`", truncated)
+        }
+        "grep" => {
+            let pattern = args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pattern");
+            format!("grep \"{}\"", pattern)
+        }
+        "find_path" => {
+            let pattern = args
+                .get("pattern")
+                .and_then(|v| v.as_str())
+                .unwrap_or("*");
+            format!("Find `{}`", pattern)
+        }
+        "list_directory" => {
+            let path = args
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(".");
+            format!("List `{}`", path)
+        }
+        "fetch" => {
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("URL");
+            format!("Fetch {}", url)
+        }
+        "web_search" => {
+            let query = args
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("query");
+            format!("Search \"{}\"", query)
+        }
+        "todo_write" => "Update TODOs".to_string(),
+        "todo_read" => "Read TODOs".to_string(),
+        "task" => {
+            let desc = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("task");
+            format!("Task: {}", desc)
+        }
+        "task_complete" => {
+            let summary = args
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Done");
+            format!("Complete: {}", summary)
+        }
+        _ => format!("Calling {}", name),
     }
 }
 

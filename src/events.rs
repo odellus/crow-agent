@@ -38,7 +38,14 @@ pub enum AgentEvent {
     },
 
     // === Tool Execution ===
-    /// Tool call started
+    /// Tool call detected - arguments still streaming
+    /// Emitted as soon as we know the tool name, before arguments are complete
+    ToolCallPending {
+        agent: String,
+        call_id: String,
+        tool: String,
+    },
+    /// Tool call started execution (arguments complete)
     ToolCallStart {
         agent: String,
         call_id: String,
