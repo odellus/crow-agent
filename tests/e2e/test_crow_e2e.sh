@@ -124,10 +124,10 @@ else
 fi
 
 # ============================================================
-echo -e "\n${CYAN}=== Test 7: Write via Bash ===${NC}"
+echo -e "\n${CYAN}=== Test 7: Write File Tool ===${NC}"
 # ============================================================
-info "Testing file creation (currently uses bash)"
-"$CROW_AGENT" prompt "Create a file called hello.txt with the content: Hello from Crow" 2>&1 > /dev/null || true
+info "Testing file creation with write_file tool"
+"$CROW_AGENT" prompt "Use the write_file tool to create a file called hello.txt with the content: Hello from Crow" 2>&1 > /dev/null || true
 sleep 1
 
 if [[ -f "hello.txt" ]] && grep -qi "crow\|hello" hello.txt 2>/dev/null; then

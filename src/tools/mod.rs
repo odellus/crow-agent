@@ -13,6 +13,7 @@ mod task;
 mod task_complete;
 mod todo;
 mod web_search;
+mod write_file;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
@@ -25,6 +26,7 @@ pub use task::TaskTool;
 pub use task_complete::TaskCompleteTool;
 pub use todo::{TodoItem, TodoReadTool, TodoStatus, TodoStore, TodoWriteTool};
 pub use web_search::WebSearchTool;
+pub use write_file::WriteFileTool;
 
 use crate::agent::AgentRegistry;
 use crate::provider::ProviderClient;
@@ -41,6 +43,9 @@ pub fn create_registry(working_dir: PathBuf) -> ToolRegistry {
 
     // File editing
     registry.register(EditTool::new(working_dir.clone()));
+
+    // File writing
+    registry.register(WriteFileTool::new(working_dir.clone()));
 
     // Shell execution
     registry.register(BashTool::new());
@@ -126,8 +131,7 @@ pub async fn create_full_registry_async(
     let base_registry = create_registry(working_dir.clone());
 
     // Create the task tool with dynamic agent descriptions
-    let task_tool =
-        TaskTool::new_with_registry(agent_registry, provider, base_registry).await;
+    let task_tool = TaskTool::new_with_registry(agent_registry, provider, base_registry).await;
 
     // Now build the full registry
     let mut registry = create_registry(working_dir);
@@ -172,7 +176,10 @@ pub fn create_coagent_registry(
     registry.register(WebSearchTool::new());
 
     // Todo tools - SHARED with primary
-    registry.register(TodoWriteTool::new(todo_store.clone(), coagent_session_id.clone()));
+    registry.register(TodoWriteTool::new(
+        todo_store.clone(),
+        coagent_session_id.clone(),
+    ));
     registry.register(TodoReadTool::new(todo_store, coagent_session_id));
 
     // Task complete - coagent can signal completion
@@ -181,6 +188,7 @@ pub fn create_coagent_registry(
     // Write tools only if not read-only mode
     if !read_only {
         registry.register(EditTool::new(working_dir.clone()));
+        registry.register(WriteFileTool::new(working_dir.clone()));
         registry.register(BashTool::new());
     }
 
