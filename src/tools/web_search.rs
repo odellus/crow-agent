@@ -1,38 +1,30 @@
 //! Web search tool using SearXNG
+//!
+//! Ported from tools/web_search.rs
 
+use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
+use async_trait::async_trait;
 use reqwest::Client;
-use rig::tool::Tool;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::{json, Value};
 
-#[derive(Debug, thiserror::Error)]
-pub enum WebSearchError {
-    #[error("HTTP request failed: {0}")]
-    Request(#[from] reqwest::Error),
-    #[error("Search failed: {0}")]
-    SearchFailed(String),
-}
-
-/// Search the web using SearXNG
-#[derive(Debug, Serialize, Deserialize)]
-pub struct WebSearchInput {
-    /// The search query
-    pub query: String,
-    /// Maximum number of results (default: 5)
+#[derive(Debug, Deserialize)]
+struct Args {
+    query: String,
     #[serde(default = "default_limit")]
-    pub limit: usize,
+    limit: usize,
 }
 
 fn default_limit() -> usize {
     5
 }
 
-#[derive(Clone)]
-pub struct WebSearch {
+pub struct WebSearchTool {
     client: Client,
     searxng_url: String,
 }
 
-impl WebSearch {
+impl WebSearchTool {
     pub fn new() -> Self {
         let searxng_url = std::env::var("SEARXNG_URL")
             .unwrap_or_else(|_| "http://localhost:8082".to_string());
@@ -50,7 +42,7 @@ impl WebSearch {
     }
 }
 
-impl Default for WebSearch {
+impl Default for WebSearchTool {
     fn default() -> Self {
         Self::new()
     }
@@ -81,22 +73,19 @@ struct Infobox {
     content: String,
 }
 
-impl Tool for WebSearch {
-    const NAME: &'static str = "web_search";
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn name(&self) -> &str {
+        "web_search"
+    }
 
-    type Error = WebSearchError;
-    type Args = WebSearchInput;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
-        rig::completion::ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: r#"Search the web for information using SearXNG.
-Use this when you need real-time information, facts, or data.
-Results include snippets and links from relevant web pages.
-
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "web_search".to_string(),
+            description: r#"Search the web using SearXNG.
+Use for real-time information, facts, or current data.
 Requires SEARXNG_URL environment variable (default: http://localhost:8082)"#.to_string(),
-            parameters: serde_json::json!({
+            parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {
@@ -105,8 +94,7 @@ Requires SEARXNG_URL environment variable (default: http://localhost:8082)"#.to_
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of results (default: 5)",
-                        "default": 5
+                        "description": "Maximum results (default: 5)"
                     }
                 },
                 "required": ["query"]
@@ -114,19 +102,56 @@ Requires SEARXNG_URL environment variable (default: http://localhost:8082)"#.to_
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let response = self
+    /// Humanize: query + first 30 lines of results
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let query = args.get("query").and_then(|v| v.as_str())?;
+
+        if result.is_error {
+            return Some(format!("search \"{}\" → err: {}", query, result.output));
+        }
+
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more lines)", first_30, total - 30)
+        };
+
+        Some(format!("search \"{}\"\n{}", query, preview))
+    }
+
+    async fn execute(&self, args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        if ctx.is_cancelled() {
+            return ToolResult::error("Cancelled");
+        }
+
+        let args: Args = match serde_json::from_value(args_value) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        };
+
+        let response = match self
             .client
             .get(format!("{}/search", self.searxng_url))
             .query(&[("q", &args.query), ("format", &"json".to_string())])
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return ToolResult::error(format!("Search request failed: {}", e)),
+        };
 
         if !response.status().is_success() {
-            return Err(WebSearchError::SearchFailed(response.status().to_string()));
+            return ToolResult::error(format!("Search failed: {}", response.status()));
         }
 
-        let data: SearxResponse = response.json().await?;
+        let data: SearxResponse = match response.json().await {
+            Ok(d) => d,
+            Err(e) => return ToolResult::error(format!("Failed to parse response: {}", e)),
+        };
 
         let mut text = String::new();
 
@@ -150,7 +175,7 @@ Requires SEARXNG_URL environment variable (default: http://localhost:8082)"#.to_
             }
         }
 
-        Ok(text)
+        ToolResult::success(text)
     }
 }
 
@@ -160,13 +185,13 @@ mod tests {
 
     #[test]
     fn test_default_url() {
-        let search = WebSearch::new();
+        let search = WebSearchTool::new();
         assert!(search.searxng_url.contains("localhost") || search.searxng_url.contains("8082"));
     }
 
     #[test]
     fn test_custom_url() {
-        let search = WebSearch::with_url("http://example.com:9000");
+        let search = WebSearchTool::with_url("http://example.com:9000");
         assert_eq!(search.searxng_url, "http://example.com:9000");
     }
 }

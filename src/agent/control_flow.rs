@@ -86,7 +86,7 @@ use crate::agent::{fixtures::humanize_turn, AgentConfig, BaseAgent, ToolExecutor
 use crate::events::{AgentEvent, TurnCompleteReason, TurnResult};
 use crate::provider::ProviderClient;
 use crate::telemetry::Telemetry;
-use crate::tools2::TodoStore;
+use crate::tools::TodoStore;
 use async_openai::types::{
     ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessageArgs,
     ChatCompletionRequestMessage, ChatCompletionRequestUserMessageArgs, ChatCompletionTool,
@@ -197,13 +197,17 @@ pub fn init_coagent_session(
 }
 
 /// Extract text content from a user message
-fn extract_user_content(user_msg: &async_openai::types::ChatCompletionRequestUserMessage) -> String {
+fn extract_user_content(
+    user_msg: &async_openai::types::ChatCompletionRequestUserMessage,
+) -> String {
     match &user_msg.content {
         async_openai::types::ChatCompletionRequestUserMessageContent::Text(text) => text.clone(),
         async_openai::types::ChatCompletionRequestUserMessageContent::Array(parts) => {
             let mut text = String::new();
             for part in parts {
-                if let async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) = part {
+                if let async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) =
+                    part
+                {
                     if !text.is_empty() {
                         text.push('\n');
                     }
@@ -437,7 +441,12 @@ impl Agent {
             name: name.clone(),
             description: primary_config.description.clone(),
             config: primary_config.clone(),
-            primary: BaseAgent::with_telemetry(primary_config, provider, working_dir.clone(), telemetry),
+            primary: BaseAgent::with_telemetry(
+                primary_config,
+                provider,
+                working_dir.clone(),
+                telemetry,
+            ),
             coagent: None,
             control_flow,
             max_turns: 100,
@@ -490,8 +499,18 @@ impl Agent {
             name: name.clone(),
             description: primary_config.description.clone(),
             config: primary_config.clone(),
-            primary: BaseAgent::with_telemetry(primary_config, provider.clone(), working_dir.clone(), telemetry.clone()),
-            coagent: Some(BaseAgent::with_telemetry(coagent_config, provider, wd, telemetry)),
+            primary: BaseAgent::with_telemetry(
+                primary_config,
+                provider.clone(),
+                working_dir.clone(),
+                telemetry.clone(),
+            ),
+            coagent: Some(BaseAgent::with_telemetry(
+                coagent_config,
+                provider,
+                wd,
+                telemetry,
+            )),
             control_flow,
             max_turns: 100,
             working_dir,
@@ -568,7 +587,7 @@ impl Agent {
         coagent_messages: &mut Option<Vec<ChatCompletionRequestMessage>>,
         coagent_tools: &[ChatCompletionTool],
         tool_executor: &dyn ToolExecutor,
-        event_tx: mpsc::UnboundedSender<AgentEvent>,  // Takes ownership so channel closes when we return
+        event_tx: mpsc::UnboundedSender<AgentEvent>, // Takes ownership so channel closes when we return
         cancellation: CancellationToken,
     ) -> RunResult {
         let mut turns = 0;
@@ -765,10 +784,7 @@ mod tests {
 
         // Should have just the opening user message
         assert_eq!(coagent.len(), 1);
-        assert!(matches!(
-            &coagent[0],
-            ChatCompletionRequestMessage::User(_)
-        ));
+        assert!(matches!(&coagent[0], ChatCompletionRequestMessage::User(_)));
     }
 
     #[test]
@@ -838,23 +854,19 @@ mod tests {
 
     #[test]
     fn test_init_coagent_session_skips_system() {
-        let primary: Vec<ChatCompletionRequestMessage> = vec![
-            ChatCompletionRequestMessage::System(
+        let primary: Vec<ChatCompletionRequestMessage> =
+            vec![ChatCompletionRequestMessage::System(
                 ChatCompletionRequestSystemMessageArgs::default()
                     .content("System prompt should be skipped")
                     .build()
                     .unwrap(),
-            ),
-        ];
+            )];
 
         let coagent = init_coagent_session(&primary);
 
         // Only the opening user message, system was skipped
         assert_eq!(coagent.len(), 1);
-        assert!(matches!(
-            &coagent[0],
-            ChatCompletionRequestMessage::User(_)
-        ));
+        assert!(matches!(&coagent[0], ChatCompletionRequestMessage::User(_)));
     }
 
     #[test]

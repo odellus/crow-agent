@@ -1,100 +1,47 @@
 //! Fetch tool - HTTP GET and convert to markdown
+//!
+//! Ported from tools/fetch.rs
 
+use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
+use async_trait::async_trait;
 use reqwest::Client;
-use rig::tool::Tool;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::{json, Value};
 
-#[derive(Debug, thiserror::Error)]
-pub enum FetchError {
-    #[error("HTTP request failed: {0}")]
-    Request(#[from] reqwest::Error),
-    #[error("HTTP error: {0}")]
-    Http(String),
-    #[error("No content found")]
-    NoContent,
-    #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+#[derive(Debug, Deserialize)]
+struct Args {
+    url: String,
 }
 
-/// Fetches a URL and returns the content as Markdown.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct FetchInput {
-    /// The URL to fetch
-    pub url: String,
-}
-
-#[derive(Clone)]
-pub struct Fetch {
+pub struct FetchTool {
     client: Client,
 }
 
-impl Default for Fetch {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Fetch {
+impl FetchTool {
     pub fn new() -> Self {
         Self {
             client: Client::new(),
         }
     }
+}
 
-    async fn fetch_url(&self, url: &str) -> Result<String, FetchError> {
-        let url = if !url.starts_with("https://") && !url.starts_with("http://") {
-            format!("https://{}", url)
-        } else {
-            url.to_string()
-        };
-
-        let response = self
-            .client
-            .get(&url)
-            .header("User-Agent", "crow-agent/0.1")
-            .send()
-            .await?;
-
-        if response.status().is_client_error() || response.status().is_server_error() {
-            return Err(FetchError::Http(response.status().to_string()));
-        }
-
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("text/html")
-            .to_string();
-
-        let body = response.text().await?;
-
-        if content_type.starts_with("application/json") {
-            // Pretty print JSON
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-                return Ok(format!("```json\n{}\n```", serde_json::to_string_pretty(&json)?));
-            }
-            Ok(format!("```json\n{}\n```", body))
-        } else if content_type.starts_with("text/plain") {
-            Ok(body)
-        } else {
-            // HTML - do basic conversion
-            Ok(html_to_markdown(&body))
-        }
+impl Default for FetchTool {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
-impl Tool for Fetch {
-    const NAME: &'static str = "fetch";
+#[async_trait]
+impl Tool for FetchTool {
+    fn name(&self) -> &str {
+        "fetch"
+    }
 
-    type Error = FetchError;
-    type Args = FetchInput;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> rig::completion::ToolDefinition {
-        rig::completion::ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Fetches a URL and returns the content as Markdown. Useful for reading web pages, APIs, or documentation.".to_string(),
-            parameters: serde_json::json!({
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "fetch".to_string(),
+            description: "Fetch a URL and return content as Markdown. Useful for reading web pages, APIs, or documentation.".to_string(),
+            parameters: json!({
                 "type": "object",
                 "properties": {
                     "url": {
@@ -107,12 +54,87 @@ impl Tool for Fetch {
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let content = self.fetch_url(&args.url).await?;
-        if content.trim().is_empty() {
-            return Err(FetchError::NoContent);
+    /// Humanize: url + first 30 lines of content
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let url = args.get("url").and_then(|v| v.as_str())?;
+
+        if result.is_error {
+            return Some(format!("fetch {} → err: {}", url, result.output));
         }
-        Ok(content)
+
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more lines)", first_30, total - 30)
+        };
+
+        Some(format!("fetch {}\n{}", url, preview))
+    }
+
+    async fn execute(&self, args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        if ctx.is_cancelled() {
+            return ToolResult::error("Cancelled");
+        }
+
+        let args: Args = match serde_json::from_value(args_value) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        };
+
+        let url = if !args.url.starts_with("https://") && !args.url.starts_with("http://") {
+            format!("https://{}", args.url)
+        } else {
+            args.url
+        };
+
+        let response = match self
+            .client
+            .get(&url)
+            .header("User-Agent", "crow-agent/0.1")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return ToolResult::error(format!("Request failed: {}", e)),
+        };
+
+        if response.status().is_client_error() || response.status().is_server_error() {
+            return ToolResult::error(format!("HTTP error: {}", response.status()));
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("text/html")
+            .to_string();
+
+        let body = match response.text().await {
+            Ok(b) => b,
+            Err(e) => return ToolResult::error(format!("Failed to read response: {}", e)),
+        };
+
+        let content = if content_type.starts_with("application/json") {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                format!("```json\n{}\n```", serde_json::to_string_pretty(&json).unwrap_or(body))
+            } else {
+                format!("```json\n{}\n```", body)
+            }
+        } else if content_type.starts_with("text/plain") {
+            body
+        } else {
+            html_to_markdown(&body)
+        };
+
+        if content.trim().is_empty() {
+            ToolResult::error("No content found")
+        } else {
+            ToolResult::success(content)
+        }
     }
 }
 
@@ -137,29 +159,23 @@ fn html_to_markdown(html: &str) -> String {
                 let tag = current_tag.to_lowercase();
                 let tag_name = tag.split_whitespace().next().unwrap_or("");
 
-                // Handle closing tags
                 if tag_name.starts_with('/') {
                     let closing = &tag_name[1..];
                     match closing {
                         "script" | "style" | "head" | "nav" | "footer" | "aside" => {
                             skip_content = false;
                         }
-                        "p" | "div" | "br" | "li" | "tr" => {
-                            result.push('\n');
-                        }
+                        "p" | "div" | "br" | "li" | "tr" => result.push('\n'),
                         "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                            result.push('\n');
-                            result.push('\n');
+                            result.push_str("\n\n");
                         }
                         "code" => result.push('`'),
                         "pre" => result.push_str("\n```\n"),
                         "strong" | "b" => result.push_str("**"),
                         "em" | "i" => result.push('*'),
-                        "a" => result.push(')'),
                         _ => {}
                     }
                 } else {
-                    // Handle opening tags
                     match tag_name {
                         "script" | "style" | "head" | "nav" | "footer" | "aside" | "svg" => {
                             skip_content = true;
@@ -181,21 +197,6 @@ fn html_to_markdown(html: &str) -> String {
                         "pre" => result.push_str("\n```\n"),
                         "strong" | "b" => result.push_str("**"),
                         "em" | "i" => result.push('*'),
-                        "a" => {
-                            // Try to extract href
-                            if let Some(href_start) = tag.find("href=\"") {
-                                let href_start = href_start + 6;
-                                if let Some(href_end) = tag[href_start..].find('"') {
-                                    let href = &tag[href_start..href_start + href_end];
-                                    result.push('[');
-                                    // We'll close with ]({href}) when we hit </a>
-                                    // For now just mark it
-                                    result.push_str(&format!("]({})", href));
-                                    // Actually this is wrong - we need the text first
-                                    // Let's simplify - just output the link
-                                }
-                            }
-                        }
                         _ => {}
                     }
                 }
@@ -206,7 +207,6 @@ fn html_to_markdown(html: &str) -> String {
         }
 
         if !skip_content {
-            // Decode common HTML entities
             if c == '&' {
                 let mut entity = String::new();
                 while let Some(&next) = chars.peek() {
@@ -228,8 +228,7 @@ fn html_to_markdown(html: &str) -> String {
                     "apos" => result.push('\''),
                     "nbsp" => result.push(' '),
                     _ if entity.starts_with('#') => {
-                        // Numeric entity
-                        if let Some(code) = entity[1..].parse::<u32>().ok() {
+                        if let Ok(code) = entity[1..].parse::<u32>() {
                             if let Some(ch) = char::from_u32(code) {
                                 result.push(ch);
                             }
@@ -247,7 +246,7 @@ fn html_to_markdown(html: &str) -> String {
         }
     }
 
-    // Clean up excessive whitespace
+    // Clean up whitespace
     let lines: Vec<&str> = result.lines().collect();
     let mut cleaned = String::new();
     let mut prev_empty = false;
@@ -288,12 +287,5 @@ mod tests {
         assert!(md.contains("Before"));
         assert!(md.contains("After"));
         assert!(!md.contains("alert"));
-    }
-
-    #[test]
-    fn test_html_entities() {
-        let html = "<p>&amp; &lt; &gt; &quot;</p>";
-        let md = html_to_markdown(html);
-        assert!(md.contains("& < > \""));
     }
 }

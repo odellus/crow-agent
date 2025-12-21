@@ -8,11 +8,7 @@ edition = "2021"
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
 
-# LLM framework - using local fork with enhanced telemetry (git submodule)
-rig-core = { path = "rig/rig-core" }
 
-# Workflow (optional for now, will use later)
-# graph-flow = { path = "../rs-graph-llm/graph-flow" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -80,8 +76,4 @@ tempfile = "3.10"
 
 [[bin]]
 name = "crow-agent"
-path = "src/bin/crow-agent.rs"
-
-[[bin]]
-name = "test_new_agent"
-path = "src/bin/test_new_agent.rs"
+path = "src/main.rs"

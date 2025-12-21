@@ -1,56 +1,34 @@
 //! List directory tool - List files and directories
+//!
+//! Ported from tools/list_directory.rs with recursive support.
 
-use rig::completion::ToolDefinition;
-use rig::tool::Tool;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
+use crate::tool::{Tool, ToolContext, ToolDefinition, ToolResult};
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{json, Value};
 use std::path::PathBuf;
-use std::sync::Arc;
-
-#[derive(Debug, thiserror::Error)]
-pub enum ListDirectoryError {
-    #[error("Directory not found: {0}")]
-    NotFound(String),
-    #[error("Not a directory: {0}")]
-    NotADirectory(String),
-    #[error("Permission denied: {0}")]
-    PermissionDenied(String),
-    #[error("IO error: {0}")]
-    Io(String),
-    #[error("Path is outside working directory: {0}")]
-    OutsideWorkDir(String),
-}
 
 #[derive(Debug, Deserialize)]
-pub struct ListDirectoryArgs {
-    /// The path to list (relative to working directory). Use "." for current directory.
-    pub path: String,
-
-    /// Include hidden files (starting with .)
+struct Args {
+    path: String,
     #[serde(default)]
-    pub show_hidden: bool,
-
-    /// Maximum depth for recursive listing (0 = current dir only, default)
+    pattern: Option<String>,
     #[serde(default)]
-    pub depth: Option<u32>,
+    recursive: bool,
 }
 
-/// Tool for listing directory contents
-#[derive(Debug, Clone)]
-pub struct ListDirectory {
-    working_dir: Arc<PathBuf>,
+pub struct ListDirectoryTool {
+    working_dir: PathBuf,
 }
 
-impl ListDirectory {
+impl ListDirectoryTool {
     pub fn new(working_dir: PathBuf) -> Self {
-        Self {
-            working_dir: Arc::new(working_dir),
-        }
+        Self { working_dir }
     }
 
-    fn resolve_path(&self, path: &str) -> Result<PathBuf, ListDirectoryError> {
+    fn resolve_path(&self, path: &str) -> Result<PathBuf, String> {
         let requested = if path.is_empty() || path == "." {
-            self.working_dir.as_ref().clone()
+            self.working_dir.clone()
         } else {
             let p = PathBuf::from(path);
             if p.is_absolute() {
@@ -60,60 +38,47 @@ impl ListDirectory {
             }
         };
 
-        let canonical = requested.canonicalize().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                ListDirectoryError::NotFound(path.to_string())
-            } else {
-                ListDirectoryError::Io(e.to_string())
-            }
-        })?;
+        let canonical = requested
+            .canonicalize()
+            .map_err(|e| format!("Path not found: {}", e))?;
 
-        let working_canonical = self.working_dir.canonicalize().map_err(|e| {
-            ListDirectoryError::Io(format!("Cannot resolve working directory: {}", e))
-        })?;
+        let working_canonical = self
+            .working_dir
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve working dir: {}", e))?;
 
         if !canonical.starts_with(&working_canonical) {
-            return Err(ListDirectoryError::OutsideWorkDir(path.to_string()));
+            return Err("Path outside working directory".to_string());
         }
 
         Ok(canonical)
     }
 
-    fn list_recursive(
+    fn list_recursive_with_pattern(
         &self,
         path: &PathBuf,
         base: &PathBuf,
-        show_hidden: bool,
+        pattern: Option<&glob::Pattern>,
         max_depth: u32,
         current_depth: u32,
         output: &mut Vec<String>,
-    ) -> Result<(), ListDirectoryError> {
+    ) -> Result<(), String> {
         if current_depth > max_depth {
             return Ok(());
         }
 
-        let entries = std::fs::read_dir(path).map_err(|e| {
-            match e.kind() {
-                std::io::ErrorKind::PermissionDenied => {
-                    ListDirectoryError::PermissionDenied(path.display().to_string())
-                }
-                _ => ListDirectoryError::Io(e.to_string()),
-            }
-        })?;
+        let entries = std::fs::read_dir(path)
+            .map_err(|e| format!("Cannot read directory: {}", e))?;
 
-        let mut items: Vec<_> = entries
-            .filter_map(|e| e.ok())
-            .collect();
-
-        // Sort by name
+        let mut items: Vec<_> = entries.filter_map(|e| e.ok()).collect();
         items.sort_by(|a, b| a.file_name().cmp(&b.file_name()));
 
         for entry in items {
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
 
-            // Skip hidden files unless requested
-            if !show_hidden && name_str.starts_with('.') {
+            // Skip hidden files
+            if name_str.starts_with('.') {
                 continue;
             }
 
@@ -121,16 +86,23 @@ impl ListDirectory {
             let relative = entry_path.strip_prefix(base).unwrap_or(&entry_path);
             let is_dir = entry_path.is_dir();
 
+            // Apply pattern filter (only to files, always show directories for navigation)
+            if let Some(pat) = pattern {
+                if !is_dir && !pat.matches(&name_str) {
+                    continue;
+                }
+            }
+
             let prefix = "  ".repeat(current_depth as usize);
             let suffix = if is_dir { "/" } else { "" };
 
             output.push(format!("{}{}{}", prefix, relative.display(), suffix));
 
             if is_dir && current_depth < max_depth {
-                self.list_recursive(
+                self.list_recursive_with_pattern(
                     &entry_path,
                     base,
-                    show_hidden,
+                    pattern,
                     max_depth,
                     current_depth + 1,
                     output,
@@ -142,49 +114,30 @@ impl ListDirectory {
     }
 }
 
-impl Serialize for ListDirectory {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_unit()
+#[async_trait]
+impl Tool for ListDirectoryTool {
+    fn name(&self) -> &str {
+        "list_directory"
     }
-}
 
-impl<'de> Deserialize<'de> for ListDirectory {
-    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Ok(Self::new(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))))
-    }
-}
-
-impl Tool for ListDirectory {
-    const NAME: &'static str = "list_directory";
-
-    type Error = ListDirectoryError;
-    type Args = ListDirectoryArgs;
-    type Output = String;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
+    fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_directory".to_string(),
-            description: r#"Lists files and directories in a given path. Prefer the `grep` or `find_path` tools when searching the codebase."#.to_string(),
+            description: "Display files and directories in a given path. Accepts glob patterns to filter results (e.g., '*.rs', 'src/**/*.ts').".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Directory path (relative to project root). Use '.' for current directory."
+                        "description": "Directory path to list (defaults to current directory)"
                     },
-                    "show_hidden": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Optional glob pattern to filter results (e.g., '*.rs')"
+                    },
+                    "recursive": {
                         "type": "boolean",
-                        "description": "Include hidden files (starting with '.') Default: false"
-                    },
-                    "depth": {
-                        "type": "integer",
-                        "description": "Maximum recursion depth (0 = current dir only). Default: 0"
+                        "description": "List files recursively (default: false)"
                     }
                 },
                 "required": ["path"]
@@ -192,33 +145,71 @@ impl Tool for ListDirectory {
         }
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let path = self.resolve_path(&args.path)?;
+    /// Humanize: path + first 30 entries
+    fn humanize(&self, args: &Value, result: &ToolResult) -> Option<String> {
+        let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
 
-        if !path.is_dir() {
-            return Err(ListDirectoryError::NotADirectory(args.path));
+        if result.is_error {
+            return Some(format!("ls {} → err: {}", path, result.output));
         }
 
-        let max_depth = args.depth.unwrap_or(0);
+        let lines: Vec<&str> = result.output.lines().collect();
+        let total = lines.len();
+
+        let preview: String = if total <= 30 {
+            result.output.clone()
+        } else {
+            let first_30 = lines[..30].join("\n");
+            format!("{}\n... ({} more entries)", first_30, total - 30)
+        };
+
+        Some(format!("ls {}\n{}", path, preview))
+    }
+
+    async fn execute(&self, args_value: serde_json::Value, ctx: &ToolContext) -> ToolResult {
+        if ctx.is_cancelled() {
+            return ToolResult::error("Cancelled");
+        }
+
+        let args: Args = match serde_json::from_value(args_value) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        };
+
+        let path = match self.resolve_path(&args.path) {
+            Ok(p) => p,
+            Err(e) => return ToolResult::error(e),
+        };
+
+        if !path.is_dir() {
+            return ToolResult::error(format!("Not a directory: {}", args.path));
+        }
+
+        // Max depth: 0 for non-recursive, high number for recursive
+        let max_depth = if args.recursive { 10 } else { 0 };
         let mut output = Vec::new();
 
-        // Add header
         output.push(format!("# {}/", args.path));
         output.push(String::new());
 
-        self.list_recursive(
+        // Build glob pattern matcher if provided
+        let glob_pattern = args.pattern.as_ref().and_then(|p| glob::Pattern::new(p).ok());
+
+        if let Err(e) = self.list_recursive_with_pattern(
             &path,
             &path,
-            args.show_hidden,
+            glob_pattern.as_ref(),
             max_depth,
             0,
             &mut output,
-        )?;
+        ) {
+            return ToolResult::error(e);
+        }
 
         if output.len() == 2 {
             output.push("(empty directory)".to_string());
         }
 
-        Ok(output.join("\n"))
+        ToolResult::success(output.join("\n"))
     }
 }

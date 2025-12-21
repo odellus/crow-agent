@@ -6,16 +6,14 @@
 //! The server communicates over stdio using JSON-RPC 2.0.
 
 use agent_client_protocol::{
-    self as acp, AgentCapabilities, AuthenticateRequest, AuthenticateResponse,
-    CancelNotification, ContentBlock, ContentChunk, ExtNotification, ExtRequest, ExtResponse,
-    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    ModelId, ModelInfo,
-    NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus,
-    PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, SessionId,
-    SessionMode, SessionModeId, SessionModeState, SessionModelState,
-    SessionNotification, SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason,
-    TextContent, ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
-    ToolKind,
+    self as acp, AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification,
+    ContentBlock, ContentChunk, ExtNotification, ExtRequest, ExtResponse, Implementation,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse, ModelId,
+    ModelInfo, NewSessionRequest, NewSessionResponse, Plan, PlanEntry, PlanEntryPriority,
+    PlanEntryStatus, PromptCapabilities, PromptRequest, PromptResponse, ProtocolVersion, SessionId,
+    SessionMode, SessionModeId, SessionModeState, SessionModelState, SessionNotification,
+    SessionUpdate, SetSessionModeRequest, SetSessionModeResponse, StopReason, TextContent,
+    ToolCall, ToolCallId, ToolCallStatus, ToolCallUpdate, ToolCallUpdateFields, ToolKind,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -36,7 +34,7 @@ use crate::provider::{ProviderClient, ProviderConfig};
 use crate::snapshot::{Patch, SnapshotManager};
 use crate::telemetry::Telemetry;
 use crate::tool::ToolRegistry;
-use crate::tools2::{self, TodoStore};
+use crate::tools::{self, TodoStore};
 
 /// Outgoing notifications from agent to client
 pub enum OutgoingNotification {
@@ -101,7 +99,11 @@ impl CrowAcpAgent {
         telemetry: Arc<Telemetry>,
     ) -> Result<Self, String> {
         // Build provider from config
-        let base_url = config.llm.base_url.as_deref().unwrap_or("http://localhost:1234/v1");
+        let base_url = config
+            .llm
+            .base_url
+            .as_deref()
+            .unwrap_or("http://localhost:1234/v1");
         let provider_config = ProviderConfig::custom(
             "lm-studio", // Use lm-studio as provider name for auth.json lookup
             base_url,
@@ -139,7 +141,6 @@ impl CrowAcpAgent {
         rx.await.map_err(|_| acp::Error::internal_error())?;
         Ok(())
     }
-
 }
 
 #[async_trait::async_trait(?Send)]
@@ -156,10 +157,7 @@ impl acp::Agent for CrowAcpAgent {
                     .load_session(false)
                     .prompt_capabilities(PromptCapabilities::default()),
             )
-            .agent_info(Implementation::new(
-                "crow-agent",
-                env!("CARGO_PKG_VERSION"),
-            )))
+            .agent_info(Implementation::new("crow-agent", env!("CARGO_PKG_VERSION"))))
     }
 
     async fn authenticate(&self, _args: AuthenticateRequest) -> acp::Result<AuthenticateResponse> {
@@ -203,11 +201,10 @@ impl acp::Agent for CrowAcpAgent {
 
         // Use "build" agent by default (matches CLI default)
         let agent_name = "build".to_string();
-        let agent_config = agent_registry.get(&agent_name).await
-            .ok_or_else(|| {
-                error!("Agent '{}' not found", agent_name);
-                acp::Error::internal_error()
-            })?;
+        let agent_config = agent_registry.get(&agent_name).await.ok_or_else(|| {
+            error!("Agent '{}' not found", agent_name);
+            acp::Error::internal_error()
+        })?;
 
         // Get control flow from agent config
         let control_flow = agent_config.get_control_flow();
@@ -220,11 +217,10 @@ impl acp::Agent for CrowAcpAgent {
         let (agent, coagent_registry, coagent_tools) = if agent_config.has_coagent() {
             // Load coagent config
             let coagent_name = agent_config.coagent_name();
-            let coagent_config = agent_registry.get(coagent_name).await
-                .ok_or_else(|| {
-                    error!("Coagent '{}' not found", coagent_name);
-                    acp::Error::internal_error()
-                })?;
+            let coagent_config = agent_registry.get(coagent_name).await.ok_or_else(|| {
+                error!("Coagent '{}' not found", coagent_name);
+                acp::Error::internal_error()
+            })?;
 
             // Coagent uses same session_id as primary for trace linking
             let coagent_session_id = telemetry_session_id.clone();
@@ -239,10 +235,14 @@ impl acp::Agent for CrowAcpAgent {
                 control_flow,
                 self.telemetry.clone(),
             )
-            .with_shared_todos(todo_store.clone(), &telemetry_session_id, &coagent_session_id);
+            .with_shared_todos(
+                todo_store.clone(),
+                &telemetry_session_id,
+                &coagent_session_id,
+            );
 
             // Create coagent tool registry with shared TodoStore
-            let coagent_reg = tools2::create_coagent_registry(
+            let coagent_reg = tools::create_coagent_registry(
                 working_dir.clone(),
                 coagent_session_id,
                 todo_store.clone(),
@@ -272,7 +272,7 @@ impl acp::Agent for CrowAcpAgent {
 
         // Create primary tool registry with task tool for subagent spawning
         // Clone agent_registry since create_full_registry_async takes ownership
-        let registry = tools2::create_full_registry_async(
+        let registry = tools::create_full_registry_async(
             working_dir.clone(),
             telemetry_session_id,
             todo_store.clone(),
@@ -289,39 +289,30 @@ impl acp::Agent for CrowAcpAgent {
             .collect();
 
         // Build system prompt
-        let system_prompt = build_system_prompt(&model, &working_dir, agent_config.system_prompt.as_deref());
+        let system_prompt =
+            build_system_prompt(&model, &working_dir, agent_config.system_prompt.as_deref());
 
         // Create snapshot manager for this session's working directory
         let snapshot_manager = SnapshotManager::for_directory(working_dir.clone());
 
         // Initialize history with system prompt
-        let history = vec![
-            ChatCompletionRequestSystemMessageArgs::default()
-                .content(system_prompt.clone())
-                .build()
-                .map_err(|_| acp::Error::internal_error())?
-                .into(),
-        ];
+        let history = vec![ChatCompletionRequestSystemMessageArgs::default()
+            .content(system_prompt.clone())
+            .build()
+            .map_err(|_| acp::Error::internal_error())?
+            .into()];
 
         // Build mode state for response
-        let modes = SessionModeState::new(
-            SessionModeId::new(agent_name.as_str()),
-            available_modes,
-        );
+        let modes = SessionModeState::new(SessionModeId::new(agent_name.as_str()), available_modes);
 
         // Build model state for response
         // For now, expose the configured model as the only available model
         let current_model = model.clone();
-        let available_models = vec![
-            ModelInfo::new(
-                ModelId::new(current_model.as_str()),
-                current_model.clone(),
-            ),
-        ];
-        let models = SessionModelState::new(
+        let available_models = vec![ModelInfo::new(
             ModelId::new(current_model.as_str()),
-            available_models,
-        );
+            current_model.clone(),
+        )];
+        let models = SessionModelState::new(ModelId::new(current_model.as_str()), available_models);
 
         // Store the session
         self.sessions.borrow_mut().insert(
@@ -354,25 +345,35 @@ impl acp::Agent for CrowAcpAgent {
         Err(acp::Error::method_not_found())
     }
 
-    async fn set_session_mode(&self, args: SetSessionModeRequest) -> acp::Result<SetSessionModeResponse> {
+    async fn set_session_mode(
+        &self,
+        args: SetSessionModeRequest,
+    ) -> acp::Result<SetSessionModeResponse> {
         let session_id = args.session_id.0.to_string();
         let new_mode_id = args.mode_id.0.to_string();
-        info!("ACP set_session_mode: session_id={}, mode_id={}", session_id, new_mode_id);
+        info!(
+            "ACP set_session_mode: session_id={}, mode_id={}",
+            session_id, new_mode_id
+        );
 
         // Get session data we need (including existing TodoStore to preserve state)
         let (agent_registry, working_dir, todo_store) = {
             let sessions = self.sessions.borrow();
-            let session = sessions.get(&session_id)
+            let session = sessions
+                .get(&session_id)
                 .ok_or_else(acp::Error::invalid_params)?;
-            (session.agent_registry.clone(), session.working_dir.clone(), session.todo_store.clone())
+            (
+                session.agent_registry.clone(),
+                session.working_dir.clone(),
+                session.todo_store.clone(),
+            )
         };
 
         // Load the new agent config
-        let agent_config = agent_registry.get(&new_mode_id).await
-            .ok_or_else(|| {
-                error!("Agent '{}' not found", new_mode_id);
-                acp::Error::invalid_params()
-            })?;
+        let agent_config = agent_registry.get(&new_mode_id).await.ok_or_else(|| {
+            error!("Agent '{}' not found", new_mode_id);
+            acp::Error::invalid_params()
+        })?;
 
         // Get control flow from agent config
         let control_flow = agent_config.get_control_flow();
@@ -383,11 +384,10 @@ impl acp::Agent for CrowAcpAgent {
         // Check if we need a coagent
         let (new_agent, new_coagent_registry, new_coagent_tools) = if agent_config.has_coagent() {
             let coagent_name = agent_config.coagent_name();
-            let coagent_config = agent_registry.get(coagent_name).await
-                .ok_or_else(|| {
-                    error!("Coagent '{}' not found", coagent_name);
-                    acp::Error::internal_error()
-                })?;
+            let coagent_config = agent_registry.get(coagent_name).await.ok_or_else(|| {
+                error!("Coagent '{}' not found", coagent_name);
+                acp::Error::internal_error()
+            })?;
 
             let coagent_session_id = telemetry_session_id.clone();
 
@@ -400,9 +400,13 @@ impl acp::Agent for CrowAcpAgent {
                 control_flow,
                 self.telemetry.clone(),
             )
-            .with_shared_todos(todo_store.clone(), &telemetry_session_id, &coagent_session_id);
+            .with_shared_todos(
+                todo_store.clone(),
+                &telemetry_session_id,
+                &coagent_session_id,
+            );
 
-            let coagent_reg = tools2::create_coagent_registry(
+            let coagent_reg = tools::create_coagent_registry(
                 working_dir.clone(),
                 coagent_session_id,
                 todo_store.clone(),
@@ -429,7 +433,7 @@ impl acp::Agent for CrowAcpAgent {
         };
 
         // Create new tool registry
-        let new_registry = tools2::create_full_registry_async(
+        let new_registry = tools::create_full_registry_async(
             working_dir.clone(),
             telemetry_session_id,
             todo_store.clone(),
@@ -447,7 +451,8 @@ impl acp::Agent for CrowAcpAgent {
 
         // Build new system prompt
         let model = self.config.llm.model.clone();
-        let system_prompt = build_system_prompt(&model, &working_dir, agent_config.system_prompt.as_deref());
+        let system_prompt =
+            build_system_prompt(&model, &working_dir, agent_config.system_prompt.as_deref());
 
         // Update session with new agent
         {
@@ -545,7 +550,9 @@ impl acp::Agent for CrowAcpAgent {
         }
 
         // Run the agent turn and stream events
-        let result = self.run_agent_turn(&session_id, &args.session_id, cancellation, snapshot_hash).await;
+        let result = self
+            .run_agent_turn(&session_id, &args.session_id, cancellation, snapshot_hash)
+            .await;
 
         // Clear cancellation token
         {
@@ -582,12 +589,14 @@ impl acp::Agent for CrowAcpAgent {
                 let params = serde_json::from_str::<serde_json::Value>(args.params.get())
                     .unwrap_or(serde_json::Value::Null);
 
-                let session_id = params.get("session_id")
+                let session_id = params
+                    .get("session_id")
                     .and_then(|v| v.as_str())
                     .ok_or_else(acp::Error::invalid_params)?;
 
                 let sessions = self.sessions.borrow();
-                let session = sessions.get(session_id)
+                let session = sessions
+                    .get(session_id)
                     .ok_or_else(acp::Error::invalid_params)?;
 
                 let patches = session.patches.borrow();
@@ -595,8 +604,10 @@ impl acp::Agent for CrowAcpAgent {
                 if patches.is_empty() {
                     return Ok(ExtResponse::new(
                         serde_json::value::RawValue::from_string(
-                            r#"{"reverted": false, "reason": "no patches available"}"#.to_string()
-                        ).unwrap().into(),
+                            r#"{"reverted": false, "reason": "no patches available"}"#.to_string(),
+                        )
+                        .unwrap()
+                        .into(),
                     ));
                 }
 
@@ -611,8 +622,11 @@ impl acp::Agent for CrowAcpAgent {
                     } else {
                         return Ok(ExtResponse::new(
                             serde_json::value::RawValue::from_string(
-                                r#"{"reverted": false, "reason": "invalid patch index"}"#.to_string()
-                            ).unwrap().into(),
+                                r#"{"reverted": false, "reason": "invalid patch index"}"#
+                                    .to_string(),
+                            )
+                            .unwrap()
+                            .into(),
                         ));
                     }
                 } else {
@@ -644,8 +658,11 @@ impl acp::Agent for CrowAcpAgent {
                                     "reverted": true,
                                     "patches_reverted": reverted_count,
                                     "files": files_reverted
-                                }).to_string()
-                            ).unwrap().into(),
+                                })
+                                .to_string(),
+                            )
+                            .unwrap()
+                            .into(),
                         ))
                     }
                     Err(e) => {
@@ -655,8 +672,11 @@ impl acp::Agent for CrowAcpAgent {
                                 serde_json::json!({
                                     "reverted": false,
                                     "reason": e
-                                }).to_string()
-                            ).unwrap().into(),
+                                })
+                                .to_string(),
+                            )
+                            .unwrap()
+                            .into(),
                         ))
                     }
                 }
@@ -666,12 +686,14 @@ impl acp::Agent for CrowAcpAgent {
                 let params = serde_json::from_str::<serde_json::Value>(args.params.get())
                     .unwrap_or(serde_json::Value::Null);
 
-                let session_id = params.get("session_id")
+                let session_id = params
+                    .get("session_id")
                     .and_then(|v| v.as_str())
                     .ok_or_else(acp::Error::invalid_params)?;
 
                 let sessions = self.sessions.borrow();
-                let session = sessions.get(session_id)
+                let session = sessions
+                    .get(session_id)
                     .ok_or_else(acp::Error::invalid_params)?;
 
                 let patches = session.patches.borrow();
@@ -685,18 +707,18 @@ impl acp::Agent for CrowAcpAgent {
 
                 Ok(ExtResponse::new(
                     serde_json::value::RawValue::from_string(
-                        serde_json::json!({ "patches": patch_list }).to_string()
-                    ).unwrap().into(),
+                        serde_json::json!({ "patches": patch_list }).to_string(),
+                    )
+                    .unwrap()
+                    .into(),
                 ))
             }
 
-            _ => {
-                Ok(ExtResponse::new(
-                    serde_json::value::RawValue::from_string("null".to_string())
-                        .unwrap()
-                        .into(),
-                ))
-            }
+            _ => Ok(ExtResponse::new(
+                serde_json::value::RawValue::from_string("null".to_string())
+                    .unwrap()
+                    .into(),
+            )),
         }
     }
 
@@ -720,7 +742,8 @@ impl CrowAcpAgent {
         // Get session data we need
         let (mut messages, tools, coagent_tools, coagent_registry, registry, has_coagent) = {
             let sessions = self.sessions.borrow();
-            let session = sessions.get(session_id)
+            let session = sessions
+                .get(session_id)
                 .ok_or_else(acp::Error::invalid_params)?;
             let history = session.history.borrow().clone();
             (
@@ -749,7 +772,8 @@ impl CrowAcpAgent {
         // Take agent out of session for the duration of the run
         let mut agent = {
             let sessions = self.sessions.borrow();
-            let session = sessions.get(session_id)
+            let session = sessions
+                .get(session_id)
                 .ok_or_else(acp::Error::invalid_params)?;
             let agent_opt = session.agent.borrow_mut().take();
             agent_opt.ok_or_else(acp::Error::internal_error)?
@@ -771,50 +795,69 @@ impl CrowAcpAgent {
             while let Some(event) = event_rx.recv().await {
                 match event {
                     AgentEvent::TextDelta { delta, .. } => {
-                        let _ = self.send_update(SessionNotification::new(
-                            acp_session_id.clone(),
-                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                ContentBlock::Text(TextContent::new(delta)),
-                            )),
-                        )).await;
+                        let _ = self
+                            .send_update(SessionNotification::new(
+                                acp_session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(delta)),
+                                )),
+                            ))
+                            .await;
                     }
 
                     AgentEvent::ThinkingDelta { delta, .. } => {
-                        let _ = self.send_update(SessionNotification::new(
-                            acp_session_id.clone(),
-                            SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                                ContentBlock::Text(TextContent::new(delta)),
-                            )),
-                        )).await;
+                        let _ = self
+                            .send_update(SessionNotification::new(
+                                acp_session_id.clone(),
+                                SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(delta)),
+                                )),
+                            ))
+                            .await;
                     }
 
-                    AgentEvent::ToolCallStart { call_id, tool, arguments, .. } => {
+                    AgentEvent::ToolCallStart {
+                        call_id,
+                        tool,
+                        arguments,
+                        ..
+                    } => {
                         let tool_call_id = ToolCallId::from(call_id);
                         let kind = tool_name_to_kind(&tool);
                         let title = format!("Calling {}", tool);
 
-                        let _ = self.send_update(SessionNotification::new(
-                            acp_session_id.clone(),
-                            SessionUpdate::ToolCall(
-                                ToolCall::new(tool_call_id, title)
-                                    .kind(kind)
-                                    .status(ToolCallStatus::InProgress)
-                                    .raw_input(arguments.clone()),
-                            ),
-                        )).await;
+                        let _ = self
+                            .send_update(SessionNotification::new(
+                                acp_session_id.clone(),
+                                SessionUpdate::ToolCall(
+                                    ToolCall::new(tool_call_id, title)
+                                        .kind(kind)
+                                        .status(ToolCallStatus::InProgress)
+                                        .raw_input(arguments.clone()),
+                                ),
+                            ))
+                            .await;
 
                         // Handle todo_write specially
                         if tool == "todo_write" {
                             if let Some(plan) = parse_todo_write_to_plan(&arguments) {
-                                let _ = self.send_update(SessionNotification::new(
-                                    acp_session_id.clone(),
-                                    SessionUpdate::Plan(plan),
-                                )).await;
+                                let _ = self
+                                    .send_update(SessionNotification::new(
+                                        acp_session_id.clone(),
+                                        SessionUpdate::Plan(plan),
+                                    ))
+                                    .await;
                             }
                         }
                     }
 
-                    AgentEvent::ToolCallEnd { call_id, tool, output, is_error, .. } => {
+                    AgentEvent::ToolCallEnd {
+                        call_id,
+                        tool,
+                        output,
+                        is_error,
+                        ..
+                    } => {
                         let tool_call_id = ToolCallId::from(call_id);
                         let status = if is_error {
                             ToolCallStatus::Failed
@@ -822,22 +865,22 @@ impl CrowAcpAgent {
                             ToolCallStatus::Completed
                         };
 
-                        let _ = self.send_update(SessionNotification::new(
-                            acp_session_id.clone(),
-                            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                                tool_call_id,
-                                ToolCallUpdateFields::new()
-                                    .status(status)
-                                    .content(vec![output.clone().into()]),
-                            )),
-                        )).await;
+                        let _ = self
+                            .send_update(SessionNotification::new(
+                                acp_session_id.clone(),
+                                SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                                    tool_call_id,
+                                    ToolCallUpdateFields::new()
+                                        .status(status)
+                                        .content(vec![output.clone().into()]),
+                                )),
+                            ))
+                            .await;
 
                         // Track file changes for undo
                         if let Some(ref hash) = snapshot_hash {
-                            let is_file_modifying = matches!(
-                                tool.as_str(),
-                                "edit" | "write" | "bash"
-                            );
+                            let is_file_modifying =
+                                matches!(tool.as_str(), "edit" | "write" | "bash");
 
                             if is_file_modifying {
                                 let sessions = self.sessions.borrow();
@@ -845,7 +888,9 @@ impl CrowAcpAgent {
                                     if let Ok(patch) = session.snapshot_manager.patch(hash).await {
                                         if !patch.files.is_empty() {
                                             let patch_index = session.patches.borrow().len();
-                                            let files: Vec<String> = patch.files.iter()
+                                            let files: Vec<String> = patch
+                                                .files
+                                                .iter()
                                                 .map(|f| f.display().to_string())
                                                 .collect();
                                             session.patches.borrow_mut().push(patch);
@@ -856,10 +901,15 @@ impl CrowAcpAgent {
                                                 "files": files,
                                                 "tool": tool
                                             });
-                                            if let Ok(raw) = serde_json::value::to_raw_value(&patch_data) {
-                                                let _ = self.send_ext_notification(
-                                                    ExtNotification::new("session/patch", raw.into())
-                                                ).await;
+                                            if let Ok(raw) =
+                                                serde_json::value::to_raw_value(&patch_data)
+                                            {
+                                                let _ = self
+                                                    .send_ext_notification(ExtNotification::new(
+                                                        "session/patch",
+                                                        raw.into(),
+                                                    ))
+                                                    .await;
                                             }
                                         }
                                     }
@@ -869,12 +919,17 @@ impl CrowAcpAgent {
                     }
 
                     AgentEvent::Error { error, .. } => {
-                        let _ = self.send_update(SessionNotification::new(
-                            acp_session_id.clone(),
-                            SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                                ContentBlock::Text(TextContent::new(format!("Error: {}", error))),
-                            )),
-                        )).await;
+                        let _ = self
+                            .send_update(SessionNotification::new(
+                                acp_session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                                    ContentBlock::Text(TextContent::new(format!(
+                                        "Error: {}",
+                                        error
+                                    ))),
+                                )),
+                            ))
+                            .await;
                     }
 
                     AgentEvent::CoagentStart { coagent, .. } => {
@@ -885,7 +940,11 @@ impl CrowAcpAgent {
                         debug!("Coagent {} ended", coagent);
                     }
 
-                    AgentEvent::Usage { input_tokens, output_tokens, .. } => {
+                    AgentEvent::Usage {
+                        input_tokens,
+                        output_tokens,
+                        ..
+                    } => {
                         debug!("Token usage: {} in, {} out", input_tokens, output_tokens);
                     }
 
@@ -974,17 +1033,15 @@ pub async fn run_stdio_server(config: Config, telemetry: Arc<Telemetry>) -> acp:
     let (tx, mut rx) = mpsc::unbounded_channel();
 
     // Create the agent
-    let agent = CrowAcpAgent::new(tx, config, telemetry)
-        .map_err(|e| {
-            error!("Failed to create agent: {}", e);
-            acp::Error::internal_error()
-        })?;
+    let agent = CrowAcpAgent::new(tx, config, telemetry).map_err(|e| {
+        error!("Failed to create agent: {}", e);
+        acp::Error::internal_error()
+    })?;
 
     // Start the connection
-    let (conn, handle_io) =
-        acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
-            tokio::task::spawn_local(fut);
-        });
+    let (conn, handle_io) = acp::AgentSideConnection::new(agent, outgoing, incoming, |fut| {
+        tokio::task::spawn_local(fut);
+    });
 
     // Background task to send notifications
     tokio::task::spawn_local(async move {
