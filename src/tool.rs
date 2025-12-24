@@ -2,10 +2,12 @@
 //!
 //! Tools implement the `Tool` trait and are registered with `ToolRegistry`.
 
+use crate::provider::ProviderClient;
+use async_openai::types::ChatCompletionRequestMessage;
 use async_trait::async_trait;
+use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use indexmap::IndexMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -46,6 +48,10 @@ impl ToolResult {
 pub struct ToolContext {
     pub working_dir: PathBuf,
     pub cancellation: CancellationToken,
+    /// Conversation history (for tools that need to evaluate context)
+    pub messages: Option<Vec<ChatCompletionRequestMessage>>,
+    /// Provider client (for tools that need to make LLM calls)
+    pub provider: Option<Arc<ProviderClient>>,
 }
 
 impl ToolContext {
@@ -53,6 +59,23 @@ impl ToolContext {
         Self {
             working_dir,
             cancellation,
+            messages: None,
+            provider: None,
+        }
+    }
+
+    /// Create a context with messages and provider for evaluation tools
+    pub fn with_llm(
+        working_dir: PathBuf,
+        cancellation: CancellationToken,
+        messages: Vec<ChatCompletionRequestMessage>,
+        provider: Arc<ProviderClient>,
+    ) -> Self {
+        Self {
+            working_dir,
+            cancellation,
+            messages: Some(messages),
+            provider: Some(provider),
         }
     }
 
@@ -207,8 +230,16 @@ impl ToolExecutor for ToolRegistry {
         args: Value,
         working_dir: &PathBuf,
         cancellation: &CancellationToken,
+        messages: Option<&Vec<ChatCompletionRequestMessage>>,
+        provider: Option<&Arc<ProviderClient>>,
     ) -> Result<String, String> {
-        let ctx = ToolContext::new(working_dir.clone(), cancellation.clone());
+        // Build context - include messages/provider if available (for tools like task_complete)
+        let ctx = match (messages, provider) {
+            (Some(msgs), Some(prov)) => {
+                ToolContext::with_llm(working_dir.clone(), cancellation.clone(), msgs.clone(), prov.clone())
+            }
+            _ => ToolContext::new(working_dir.clone(), cancellation.clone()),
+        };
         let result = self.execute(name, args, &ctx).await;
         if result.is_error {
             Err(result.output)

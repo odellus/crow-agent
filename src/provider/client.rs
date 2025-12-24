@@ -382,6 +382,215 @@ impl ProviderClient {
         Ok(())
     }
 
+    /// Send a non-streaming chat completion with structured JSON output
+    ///
+    /// Uses OpenAI's response_format with json_schema for guaranteed structured output.
+    pub async fn chat_structured<T: serde::de::DeserializeOwned>(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        schema_name: &str,
+        schema: serde_json::Value,
+        model: Option<&str>,
+    ) -> Result<T, String> {
+        let model = model.unwrap_or(&self.config.default_model);
+        let api_key = Self::get_api_key(&self.config)?;
+
+        let messages_json: Vec<serde_json::Value> =
+            messages.iter().map(|m| self.message_to_json(m)).collect();
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages_json,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": true,
+                    "schema": schema
+                }
+            }
+        });
+
+        let start = std::time::Instant::now();
+        tracing::info!(
+            target: "llm",
+            schema_name = schema_name,
+            model = model,
+            message_count = messages.len(),
+            "Starting structured LLM call"
+        );
+
+        let response = self
+            .http_client
+            .post(format!("{}/chat/completions", self.config.base_url))
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(target: "llm", error = %e, "Structured LLM call failed");
+                format!("API request failed: {}", e)
+            })?;
+
+        let elapsed = start.elapsed();
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            tracing::error!(
+                target: "llm",
+                status = %status,
+                error = %text,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "Structured LLM call returned error"
+            );
+            return Err(format!("API error {}: {}", status, text));
+        }
+
+        let response_body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        // Extract usage if available
+        let usage = response_body.get("usage");
+        let input_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
+        let output_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64());
+
+        // Extract the content from the response
+        let content = response_body
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_str())
+            .ok_or_else(|| "No content in response".to_string())?;
+
+        tracing::info!(
+            target: "llm",
+            schema_name = schema_name,
+            model = model,
+            elapsed_ms = elapsed.as_millis() as u64,
+            input_tokens = input_tokens,
+            output_tokens = output_tokens,
+            "Structured LLM call completed"
+        );
+
+        // Parse the JSON content into the expected type
+        serde_json::from_str(content)
+            .map_err(|e| format!("Failed to parse structured response: {} (raw: {})", e, content))
+    }
+
+    /// Send a non-streaming chat completion with forced tool call for structured output
+    ///
+    /// Uses tool_choice: "required" with a single tool instead of response_format.
+    /// This works with thinking models that don't support response_format prefill.
+    pub async fn chat_tool_structured<T: serde::de::DeserializeOwned>(
+        &self,
+        messages: Vec<ChatCompletionRequestMessage>,
+        tool_name: &str,
+        tool_description: &str,
+        schema: serde_json::Value,
+        model: Option<&str>,
+    ) -> Result<T, String> {
+        let model = model.unwrap_or(&self.config.default_model);
+        let api_key = Self::get_api_key(&self.config)?;
+
+        let messages_json: Vec<serde_json::Value> =
+            messages.iter().map(|m| self.message_to_json(m)).collect();
+
+        // Create a tool with the schema as parameters
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": tool_description,
+                "parameters": schema
+            }
+        });
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages_json,
+            "tools": [tool],
+            "tool_choice": {"type": "function", "function": {"name": tool_name}}
+        });
+
+        let start = std::time::Instant::now();
+        tracing::info!(
+            target: "llm",
+            tool_name = tool_name,
+            model = model,
+            message_count = messages.len(),
+            "Starting tool-structured LLM call"
+        );
+
+        let response = self
+            .http_client
+            .post(format!("{}/chat/completions", self.config.base_url))
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(target: "llm", error = %e, "Tool-structured LLM call failed");
+                format!("API request failed: {}", e)
+            })?;
+
+        let elapsed = start.elapsed();
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            tracing::error!(
+                target: "llm",
+                status = %status,
+                error = %text,
+                elapsed_ms = elapsed.as_millis() as u64,
+                "Tool-structured LLM call returned error"
+            );
+            return Err(format!("API error {}: {}", status, text));
+        }
+
+        let response_body: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse response: {}", e))?;
+
+        // Extract usage if available
+        let usage = response_body.get("usage");
+        let input_tokens = usage.and_then(|u| u.get("prompt_tokens")).and_then(|v| v.as_u64());
+        let output_tokens = usage.and_then(|u| u.get("completion_tokens")).and_then(|v| v.as_u64());
+
+        // Extract the tool call arguments from the response
+        let arguments = response_body
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("message"))
+            .and_then(|m| m.get("tool_calls"))
+            .and_then(|tc| tc.get(0))
+            .and_then(|tc| tc.get("function"))
+            .and_then(|f| f.get("arguments"))
+            .and_then(|a| a.as_str())
+            .ok_or_else(|| "No tool call arguments in response".to_string())?;
+
+        tracing::info!(
+            target: "llm",
+            tool_name = tool_name,
+            model = model,
+            elapsed_ms = elapsed.as_millis() as u64,
+            input_tokens = input_tokens,
+            output_tokens = output_tokens,
+            "Tool-structured LLM call completed"
+        );
+
+        // Parse the arguments JSON into the expected type
+        serde_json::from_str(arguments)
+            .map_err(|e| format!("Failed to parse tool arguments: {} (raw: {})", e, arguments))
+    }
+
     /// Convert a ChatCompletionRequestMessage to JSON
     fn message_to_json(&self, msg: &ChatCompletionRequestMessage) -> serde_json::Value {
         use async_openai::types::*;

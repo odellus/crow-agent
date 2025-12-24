@@ -643,7 +643,14 @@ impl Agent {
                 }
 
                 ControlFlow::Loop => {
-                    // Just continue to next turn
+                    // Inject continuation message - without this the LLM has nothing to respond to
+                    primary_messages.push(
+                        async_openai::types::ChatCompletionRequestUserMessageArgs::default()
+                            .content("Continue. Call task_complete when finished.")
+                            .build()
+                            .unwrap()
+                            .into(),
+                    );
                 }
 
                 ControlFlow::Static { message } => {

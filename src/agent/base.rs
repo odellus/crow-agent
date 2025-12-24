@@ -518,8 +518,16 @@ impl BaseAgent {
                 let start = Instant::now();
 
                 // Execute the tool
+                // Pass messages and provider for tools that need LLM access (e.g., task_complete)
                 let result = tool_executor
-                    .execute(&tool_name, args.clone(), &self.working_dir, &cancellation)
+                    .execute(
+                        &tool_name,
+                        args.clone(),
+                        &self.working_dir,
+                        &cancellation,
+                        Some(messages),
+                        Some(&self.provider),
+                    )
                     .await;
 
                 let duration_ms = start.elapsed().as_millis() as u64;
@@ -625,5 +633,8 @@ pub trait ToolExecutor: Send + Sync {
         args: serde_json::Value,
         working_dir: &PathBuf,
         cancellation: &CancellationToken,
+        // Optional context for tools that need LLM access (e.g., task_complete evaluator)
+        messages: Option<&Vec<ChatCompletionRequestMessage>>,
+        provider: Option<&Arc<ProviderClient>>,
     ) -> Result<String, String>;
 }
